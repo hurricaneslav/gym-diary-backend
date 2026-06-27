@@ -1,5 +1,5 @@
 """
-Бэкенд дневника тренировок
+Gym diary backend
 FastAPI + SQLite
 """
 
@@ -9,192 +9,347 @@ from pydantic import BaseModel
 from typing import Optional
 import sqlite3, json, hmac, hashlib, urllib.parse, os
 
+
 app = FastAPI()
 
-# ── CORS — разрешаем запросы с GitHub Pages ──────────────────────────────────
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # после тестов замени на свой домен
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-DB_PATH   = os.environ.get("DB_PATH", "gym.db")
+DB_PATH = os.environ.get("DB_PATH", "gym.db")
 
-
-# ── База данных ───────────────────────────────────────────────────────────────
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
+
     with get_db() as conn:
+
         conn.executescript("""
-            CREATE TABLE IF NOT EXISTS workouts (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    TEXT NOT NULL,
-                name       TEXT NOT NULL,
-                date       TEXT NOT NULL,
-                exercises  TEXT NOT NULL DEFAULT '[]'
-            );
-            CREATE TABLE IF NOT EXISTS measurements (
-                id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL,
-                name    TEXT NOT NULL,
-                date    TEXT NOT NULL,
-                data    TEXT NOT NULL DEFAULT '{}'
-            );
+        CREATE TABLE IF NOT EXISTS workouts(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            exercises TEXT NOT NULL DEFAULT '[]'
+        );
+
+
+        CREATE TABLE IF NOT EXISTS measurements(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            data TEXT NOT NULL DEFAULT '{}'
+        );
+
         """)
-    print("✅ База данных готова")
+
 
 init_db()
 
 
-# ── Проверка подписи Telegram ─────────────────────────────────────────────────
 
-def verify_telegram(init_data: str) -> Optional[str]:
-    """
-    Проверяет подпись initData от Telegram и возвращает user_id.
-    Возвращает None если подпись неверна.
-    """
+def verify_telegram(init_data):
+
     if not BOT_TOKEN:
-        # В режиме разработки без токена — берём user_id напрямую
+
         try:
-            params = dict(urllib.parse.parse_qsl(init_data))
-            user   = json.loads(params.get("user", "{}"))
-            return str(user.get("id", "dev_user"))
-        except Exception:
+            params=dict(
+                urllib.parse.parse_qsl(init_data)
+            )
+
+            user=json.loads(
+                params.get("user","{}")
+            )
+
+            return str(user.get("id","dev_user"))
+
+        except:
             return "dev_user"
 
-    try:
-        params     = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
-        hash_value = params.pop("hash", "")
-        data_check = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
-        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        computed   = hmac.new(secret_key, data_check.encode(), hashlib.sha256).hexdigest()
 
-        if not hmac.compare_digest(computed, hash_value):
-            return None
 
-        user = json.loads(params.get("user", "{}"))
-        return str(user.get("id"))
-    except Exception:
+    params=dict(
+        urllib.parse.parse_qsl(
+            init_data,
+            keep_blank_values=True
+        )
+    )
+
+
+    hash_value=params.pop("hash","")
+
+
+    data_check="\n".join(
+        f"{k}={v}"
+        for k,v in sorted(params.items())
+    )
+
+
+    secret=hmac.new(
+        b"WebAppData",
+        BOT_TOKEN.encode(),
+        hashlib.sha256
+    ).digest()
+
+
+    calculated=hmac.new(
+        secret,
+        data_check.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+
+    if not hmac.compare_digest(
+        calculated,
+        hash_value
+    ):
         return None
 
 
-# ── Dependency: получить user_id из заголовка ─────────────────────────────────
+    user=json.loads(
+        params.get("user","{}")
+    )
 
-def get_user_id(x_init_data: str = Header(...)) -> str:
-    user_id = verify_telegram(x_init_data)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
-    return user_id
+    return str(user.get("id"))
 
 
-# ── Модели ────────────────────────────────────────────────────────────────────
+
+def get_user_id(
+    x_init_data:str=Header(...)
+):
+
+    uid=verify_telegram(x_init_data)
+
+    if not uid:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid telegram"
+        )
+
+    return uid
+
+
 
 class WorkoutIn(BaseModel):
-    id:        int
-    name:      str
-    date:      str
-    exercises: list
+
+    id:int=-1
+    name:str
+    date:str
+    exercises:list
+
+
 
 class MeasurementIn(BaseModel):
-    id:   int
-    name: str
-    date: str
-    data: dict = {}
+
+    id:int=-1
+    name:str
+    date:str
+    data:dict={}
 
 
-# ── Роуты: тренировки ─────────────────────────────────────────────────────────
 
 @app.get("/workouts")
-def list_workouts(user_id: str = Header(..., alias="x-user-id"), x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
+def get_workouts(
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM workouts WHERE user_id=? ORDER BY id DESC", (uid,)
+
+        rows=conn.execute(
+            """
+            SELECT *
+            FROM workouts
+            WHERE user_id=?
+            ORDER BY date ASC
+            """,
+            (uid,)
         ).fetchall()
-    return [{"id":r["id"],"name":r["name"],"date":r["date"],"exercises":json.loads(r["exercises"])} for r in rows]
+
+
+    return [
+        {
+            "id":r["id"],
+            "name":r["name"],
+            "date":r["date"],
+            "exercises":json.loads(r["exercises"])
+        }
+        for r in rows
+    ]
+
 
 
 @app.post("/workouts")
-def save_workout(w: WorkoutIn, x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
+def save_workout(
+    w:WorkoutIn,
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+
     with get_db() as conn:
-        existing = conn.execute(
-            "SELECT id FROM workouts WHERE user_id=? AND id=?", (uid, w.id)
-        ).fetchone()
-        if existing:
+
+
+        if w.id != -1:
+
+
             conn.execute(
-                "UPDATE workouts SET name=?, date=?, exercises=? WHERE user_id=? AND id=?",
-                (w.name, w.date, json.dumps(w.exercises, ensure_ascii=False), uid, w.id)
+                """
+                UPDATE workouts
+                SET name=?,date=?,exercises=?
+                WHERE id=? AND user_id=?
+                """,
+                (
+                    w.name,
+                    w.date,
+                    json.dumps(
+                        w.exercises,
+                        ensure_ascii=False
+                    ),
+                    w.id,
+                    uid
+                )
             )
+
+
+            new_id=w.id
+
+
         else:
-            conn.execute(
-                "INSERT INTO workouts (user_id, name, date, exercises) VALUES (?,?,?,?)",
-                (uid, w.name, w.date, json.dumps(w.exercises, ensure_ascii=False))
+
+
+            cur=conn.execute(
+                """
+                INSERT INTO workouts
+                (user_id,name,date,exercises)
+                VALUES(?,?,?,?)
+                """,
+                (
+                    uid,
+                    w.name,
+                    w.date,
+                    json.dumps(
+                        w.exercises,
+                        ensure_ascii=False
+                    )
+                )
             )
-    return {"ok": True}
 
 
-@app.delete("/workouts/{workout_id}")
-def delete_workout(workout_id: int, x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
+            new_id=cur.lastrowid
+
+
+
+    return {
+        "id":new_id,
+        "name":w.name,
+        "date":w.date,
+        "exercises":w.exercises
+    }
+
+
+
+
+@app.delete("/workouts/{id}")
+def delete_workout(
+    id:int,
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
     with get_db() as conn:
-        conn.execute("DELETE FROM workouts WHERE user_id=? AND id=?", (uid, workout_id))
-    return {"ok": True}
+
+        conn.execute(
+            """
+            DELETE FROM workouts
+            WHERE id=? AND user_id=?
+            """,
+            (id,uid)
+        )
 
 
-# ── Роуты: замеры ─────────────────────────────────────────────────────────────
+    return {"ok":True}
 
-@app.get("/measurements")
-def list_measurements(x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
+
+
+
+@app.patch("/exercises/rename")
+def rename_exercise(
+    body:dict,
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+    old=body["old"]
+    new=body["new"]
+
+
     with get_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM measurements WHERE user_id=? ORDER BY id DESC", (uid,)
+
+
+        rows=conn.execute(
+            """
+            SELECT id,exercises
+            FROM workouts
+            WHERE user_id=?
+            """,
+            (uid,)
         ).fetchall()
-    result = []
-    for r in rows:
-        item = {"id":r["id"],"name":r["name"],"date":r["date"]}
-        item.update(json.loads(r["data"]))
-        result.append(item)
-    return result
 
 
-@app.post("/measurements")
-def save_measurement(m: MeasurementIn, x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
-    with get_db() as conn:
-        existing = conn.execute(
-            "SELECT id FROM measurements WHERE user_id=? AND id=?", (uid, m.id)
-        ).fetchone()
-        data_json = json.dumps(m.data, ensure_ascii=False)
-        if existing:
-            conn.execute(
-                "UPDATE measurements SET name=?, date=?, data=? WHERE user_id=? AND id=?",
-                (m.name, m.date, data_json, uid, m.id)
+
+        for r in rows:
+
+            exercises=json.loads(
+                r["exercises"]
             )
-        else:
-            conn.execute(
-                "INSERT INTO measurements (user_id, name, date, data) VALUES (?,?,?,?)",
-                (uid, m.name, m.date, data_json)
-            )
-    return {"ok": True}
 
 
-@app.delete("/measurements/{measurement_id}")
-def delete_measurement(measurement_id: int, x_init_data: str = Header(...)):
-    uid = get_user_id(x_init_data)
-    with get_db() as conn:
-        conn.execute("DELETE FROM measurements WHERE user_id=? AND id=?", (uid, measurement_id))
-    return {"ok": True}
+            changed=False
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "gym-diary-api"}
+            for e in exercises:
+
+                if e.get("name")==old:
+
+                    e["name"]=new
+                    changed=True
+
+
+
+            if changed:
+
+                conn.execute(
+                    """
+                    UPDATE workouts
+                    SET exercises=?
+                    WHERE id=?
+                    """,
+                    (
+                        json.dumps(
+                            exercises,
+                            ensure_ascii=False
+                        ),
+                        r["id"]
+                    )
+                )
+
+
+    return {"ok":True}

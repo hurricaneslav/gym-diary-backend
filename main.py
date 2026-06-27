@@ -288,6 +288,138 @@ def delete_workout(
 
 
 
+@app.get("/measurements")
+def get_measurements(
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+    with get_db() as conn:
+
+        rows=conn.execute(
+            """
+            SELECT *
+            FROM measurements
+            WHERE user_id=?
+            ORDER BY date ASC
+            """,
+            (uid,)
+        ).fetchall()
+
+
+    result=[]
+
+    for r in rows:
+
+        item={
+            "id":r["id"],
+            "name":r["name"],
+            "date":r["date"]
+        }
+
+        item.update(
+            json.loads(r["data"])
+        )
+
+        result.append(item)
+
+
+    return result
+
+
+
+@app.post("/measurements")
+def save_measurement(
+    m:MeasurementIn,
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+
+    with get_db() as conn:
+
+
+        if m.id != -1:
+
+            conn.execute(
+                """
+                UPDATE measurements
+                SET name=?,date=?,data=?
+                WHERE id=? AND user_id=?
+                """,
+                (
+                    m.name,
+                    m.date,
+                    json.dumps(
+                        m.data,
+                        ensure_ascii=False
+                    ),
+                    m.id,
+                    uid
+                )
+            )
+
+
+            new_id=m.id
+
+
+        else:
+
+
+            cur=conn.execute(
+                """
+                INSERT INTO measurements
+                (user_id,name,date,data)
+                VALUES(?,?,?,?)
+                """,
+                (
+                    uid,
+                    m.name,
+                    m.date,
+                    json.dumps(
+                        m.data,
+                        ensure_ascii=False
+                    )
+                )
+            )
+
+
+            new_id=cur.lastrowid
+
+
+    return {
+        "id":new_id,
+        "name":m.name,
+        "date":m.date,
+        **m.data
+    }
+
+
+
+@app.delete("/measurements/{id}")
+def delete_measurement(
+    id:int,
+    x_init_data:str=Header(...)
+):
+
+    uid=get_user_id(x_init_data)
+
+    with get_db() as conn:
+
+        conn.execute(
+            """
+            DELETE FROM measurements
+            WHERE id=? AND user_id=?
+            """,
+            (id,uid)
+        )
+
+
+    return {"ok":True}
+
+
 
 @app.patch("/exercises/rename")
 def rename_exercise(

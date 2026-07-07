@@ -60,8 +60,8 @@ def ensure_profile_and_user(conn, uid, username=None, first_name=None):
         pid = existing["id"]
     else:
         cur = conn.execute(
-            "INSERT INTO profiles (owner_id, name, is_main, show_workouts, show_exercises, show_comments) "
-            "VALUES (?,?,1,1,1,1)",
+            "INSERT INTO profiles (owner_id, name, is_main, show_workouts, show_exercises, show_comments, show_measurements) "
+            "VALUES (?,?,1,1,1,1,1)",
             (uid, "Профиль 1")
         )
         pid = cur.lastrowid
@@ -142,6 +142,9 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(measurements)").fetchall()]
         if "profile_id" not in cols:
             conn.execute("ALTER TABLE measurements ADD COLUMN profile_id INTEGER")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
+        if "show_measurements" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN show_measurements INTEGER NOT NULL DEFAULT 1")
 
         migrate_legacy_data(conn)
 
@@ -227,11 +230,12 @@ class ProfileCreateIn(BaseModel):
     name: str
 
 class ProfileUpdateIn(BaseModel):
-    name:           Optional[str] = None
-    is_main:        Optional[bool] = None
-    show_workouts:  Optional[bool] = None
-    show_exercises: Optional[bool] = None
-    show_comments:  Optional[bool] = None
+    name:              Optional[str] = None
+    is_main:           Optional[bool] = None
+    show_workouts:     Optional[bool] = None
+    show_exercises:    Optional[bool] = None
+    show_comments:     Optional[bool] = None
+    show_measurements: Optional[bool] = None
 
 class FriendUsernameIn(BaseModel):
     username: str
@@ -353,7 +357,8 @@ def list_profiles(x_init_data: str = Header(...)):
     return [{
         "id": r["id"], "name": r["name"], "is_main": bool(r["is_main"]),
         "show_workouts": bool(r["show_workouts"]), "show_exercises": bool(r["show_exercises"]),
-        "show_comments": bool(r["show_comments"]), "is_active": r["id"] == active_id,
+        "show_comments": bool(r["show_comments"]), "show_measurements": bool(r["show_measurements"]),
+        "is_active": r["id"] == active_id,
     } for r in rows]
 
 
@@ -363,8 +368,8 @@ def create_profile(p: ProfileCreateIn, x_init_data: str = Header(...)):
     name = p.name.strip() or "Новый профиль"
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO profiles (owner_id, name, is_main, show_workouts, show_exercises, show_comments) "
-            "VALUES (?,?,0,1,1,1)",
+            "INSERT INTO profiles (owner_id, name, is_main, show_workouts, show_exercises, show_comments, show_measurements) "
+            "VALUES (?,?,0,1,1,1,1)",
             (uid, name)
         )
         return {"ok": True, "id": cur.lastrowid}
@@ -387,6 +392,8 @@ def update_profile(profile_id: int, p: ProfileUpdateIn, x_init_data: str = Heade
             fields.append("show_exercises=?"); values.append(int(p.show_exercises))
         if p.show_comments is not None:
             fields.append("show_comments=?"); values.append(int(p.show_comments))
+        if p.show_measurements is not None:
+            fields.append("show_measurements=?"); values.append(int(p.show_measurements))
         if p.is_main is not None:
             if p.is_main:
                 conn.execute("UPDATE profiles SET is_main=0 WHERE owner_id=?", (uid,))
@@ -540,11 +547,16 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
         ).fetchone()
 
         if not profile:
-            return {"name": name, "profile_name": None, "show_workouts": False, "show_exercises": False, "workouts": []}
+            return {
+                "name": name, "profile_name": None,
+                "show_workouts": False, "show_exercises": False, "show_measurements": False,
+                "workouts": [], "measurements": [],
+            }
 
         show_w = bool(profile["show_workouts"])
         show_e = bool(profile["show_exercises"])
         show_c = bool(profile["show_comments"])
+        show_m = bool(profile["show_measurements"])
 
         workouts = []
         if show_w or show_e:
@@ -558,12 +570,24 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                         ex["comment"] = ""
                 workouts.append({"id": r["id"], "name": r["name"], "date": r["date"], "exercises": exs})
 
+        measurements = []
+        if show_m:
+            rows = conn.execute(
+                "SELECT * FROM measurements WHERE profile_id=? ORDER BY id DESC", (profile["id"],)
+            ).fetchall()
+            for r in rows:
+                item = {"id": r["id"], "name": r["name"], "date": r["date"]}
+                item.update(json.loads(r["data"]))
+                measurements.append(item)
+
     return {
         "name": name,
         "profile_name": profile["name"],
         "show_workouts": show_w,
         "show_exercises": show_e,
+        "show_measurements": show_m,
         "workouts": workouts,
+        "measurements": measurements,
     }
 
 

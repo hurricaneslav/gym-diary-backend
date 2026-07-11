@@ -134,6 +134,13 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (user_a, user_b)
             );
+            CREATE TABLE IF NOT EXISTS exercise_notes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                name_lc    TEXT NOT NULL,
+                note       TEXT NOT NULL DEFAULT '',
+                UNIQUE(profile_id, name_lc)
+            );
         """)
         # Миграция: добавляем profile_id в старые таблицы, если его ещё нет
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(workouts)").fetchall()]
@@ -243,6 +250,14 @@ class FriendUsernameIn(BaseModel):
 class FriendCodeIn(BaseModel):
     code: str
 
+class ExerciseNoteIn(BaseModel):
+    name: str
+    note: str = ""
+
+class ExerciseNoteRenameIn(BaseModel):
+    old_name: str
+    new_name: str
+
 
 # ── Роуты: тренировки ─────────────────────────────────────────────────────────
 
@@ -343,6 +358,65 @@ def delete_measurement(measurement_id: int, x_init_data: str = Header(...)):
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
         conn.execute("DELETE FROM measurements WHERE profile_id=? AND id=?", (pid, measurement_id))
+    return {"ok": True}
+
+
+# ── Роуты: заметки к упражнениям ────────────────────────────────────────────
+# Общее описание упражнения (техника, сетап и т.д.) — привязано к профилю и
+# названию упражнения (без учёта регистра), не к конкретной тренировке.
+
+@app.get("/exercise-notes")
+def list_exercise_notes(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        rows = conn.execute(
+            "SELECT name_lc, note FROM exercise_notes WHERE profile_id=?", (pid,)
+        ).fetchall()
+    return {r["name_lc"]: r["note"] for r in rows}
+
+
+@app.put("/exercise-notes")
+def save_exercise_note(body: ExerciseNoteIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    name_lc = body.name.strip().lower()
+    if not name_lc:
+        raise HTTPException(400, "Пустое название упражнения")
+    note = body.note.strip()
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        if note:
+            conn.execute(
+                "INSERT OR REPLACE INTO exercise_notes (profile_id, name_lc, note) VALUES (?,?,?)",
+                (pid, name_lc, note)
+            )
+        else:
+            # Пустое описание — просто убираем запись, нет смысла её хранить
+            conn.execute("DELETE FROM exercise_notes WHERE profile_id=? AND name_lc=?", (pid, name_lc))
+    return {"ok": True}
+
+
+@app.put("/exercise-notes/rename")
+def rename_exercise_note(body: ExerciseNoteRenameIn, x_init_data: str = Header(...)):
+    """Переносит заметку на новое имя при переименовании упражнения (см. commitRenameEx на фронте)."""
+    uid = get_user_id(x_init_data)
+    old_lc = body.old_name.strip().lower()
+    new_lc = body.new_name.strip().lower()
+    if not old_lc or not new_lc or old_lc == new_lc:
+        return {"ok": True}
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        clash = conn.execute(
+            "SELECT 1 FROM exercise_notes WHERE profile_id=? AND name_lc=?", (pid, new_lc)
+        ).fetchone()
+        if clash:
+            # Под новым именем уже есть своя заметка — не перетираем её, старую просто убираем
+            conn.execute("DELETE FROM exercise_notes WHERE profile_id=? AND name_lc=?", (pid, old_lc))
+        else:
+            conn.execute(
+                "UPDATE exercise_notes SET name_lc=? WHERE profile_id=? AND name_lc=?",
+                (new_lc, pid, old_lc)
+            )
     return {"ok": True}
 
 

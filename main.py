@@ -7,11 +7,13 @@ FastAPI + SQLite
 где можно посмотреть "основной" профиль друга согласно его настройкам видимости.
 """
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3, json, hmac, hashlib, urllib.parse, os, secrets
+import sqlite3, json, hmac, hashlib, urllib.parse, os, secrets, shutil, time, html
 
 app = FastAPI()
 
@@ -668,3 +670,351 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
 @app.get("/")
 def root():
     return {"status": "ok", "service": "gym-diary-api"}
+
+
+# ── Админка ─────────────────────────────────────────────────────────────────
+# Встроенная в тот же FastAPI-процесс админка для прямого управления базой:
+# просмотр и редактирование любых таблиц, произвольные SQL-запросы, скачивание
+# и загрузка файла базы целиком. Защищена паролем через Basic Auth.
+#
+# Специально не используются внешние инструменты (sqlite-web/Adminer и т.п.)
+# и почти никаких новых зависимостей (кроме python-multipart для загрузки
+# файла) — весь код живёт в этом же main.py. Поэтому переезд с Railway на
+# VPS/другой хостинг не требует ничего, кроме переноса переменных окружения
+# (BOT_TOKEN, DB_PATH, ADMIN_PASSWORD) и самого файла базы.
+#
+# ВАЖНО: задай ADMIN_PASSWORD в Railway → Variables (длинный случайный пароль).
+# Без него админка целиком отключена (см. verify_admin ниже).
+
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+_admin_security = HTTPBasic()
+
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(_admin_security)):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(500, "ADMIN_PASSWORD не задан на сервере (Railway → Variables)")
+    if not secrets.compare_digest(credentials.password, ADMIN_PASSWORD):
+        raise HTTPException(401, "Неверный пароль", headers={"WWW-Authenticate": "Basic"})
+    return True
+
+
+ADMIN_PAGE_SIZE = 50
+
+ADMIN_CSS = """
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0A0A0A;color:#FFF;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:15px;padding:24px;max-width:1100px;margin:0 auto}
+a{color:#FFF;text-decoration:none}
+h1{font-size:20px;font-weight:700;margin-bottom:20px;letter-spacing:-.02em}
+h2{font-size:15px;font-weight:600;margin:24px 0 12px;color:#AAA}
+.nav{display:flex;gap:16px;margin-bottom:24px;border-bottom:1px solid #2A2A2A;padding-bottom:14px;font-size:13px}
+.nav a{color:#888}
+.nav a:hover{color:#FFF}
+table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:13px}
+th,td{border:1px solid #2A2A2A;padding:8px 10px;text-align:left;vertical-align:top;max-width:280px;overflow-wrap:break-word}
+th{color:#888;font-weight:600;background:#111}
+tr:hover td{background:#0F0F0F}
+.card{border:1px solid #2A2A2A;padding:14px 16px;margin-bottom:10px;background:#111}
+.btn{display:inline-block;padding:9px 14px;border:1px solid #FFF;background:transparent;color:#FFF;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+.btn:hover{background:#FFF;color:#000}
+.btn.danger{border-color:#FF4444;color:#FF4444}
+.btn.danger:hover{background:#FF4444;color:#FFF}
+.btn.ghost{border-color:#333;color:#888}
+.btn.ghost:hover{border-color:#888;color:#FFF}
+input,textarea{width:100%;background:#111;border:1px solid #2A2A2A;color:#FFF;font-size:13px;padding:9px 10px;font-family:inherit;margin-bottom:10px}
+label{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#666;margin-bottom:4px}
+.field{margin-bottom:14px}
+.warn{border:1px solid #4A3A1A;background:#161208;color:#E0A030;padding:10px 12px;font-size:13px;margin-bottom:16px}
+.err{border:1px solid #4A1A1A;background:#160808;color:#FF6B6B;padding:10px 12px;font-size:13px;margin-bottom:16px}
+.ok{border:1px solid #1A4A2A;background:#081608;color:#5FD088;padding:10px 12px;font-size:13px;margin-bottom:16px}
+.pager{display:flex;gap:10px;align-items:center;margin-bottom:16px;font-size:13px;color:#888}
+.actions{display:flex;gap:6px}
+.actions form{display:inline}
+</style>
+"""
+
+
+def admin_page(title: str, body: str) -> HTMLResponse:
+    nav = (
+        '<div class="nav">'
+        '<a href="/admin">Дашборд</a>'
+        '<a href="/admin/sql">SQL-запрос</a>'
+        '<a href="/admin/db/download">Скачать базу</a>'
+        '<a href="/admin/db/upload">Загрузить базу</a>'
+        "</div>"
+    )
+    return HTMLResponse(
+        f"<html><head><meta charset='utf-8'><title>{html.escape(title)}</title>{ADMIN_CSS}</head>"
+        f"<body><h1>{html.escape(title)}</h1>{nav}{body}</body></html>"
+    )
+
+
+def _valid_table(conn, table: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone())
+
+
+def _table_names(conn):
+    return [r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()]
+
+
+def _table_columns(conn, table: str):
+    # table уже проверен через _valid_table перед вызовом — подстановка в PRAGMA безопасна
+    return [r["name"] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+
+
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def admin_dashboard(_: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        tables = _table_names(conn)
+        cards = ""
+        for t in tables:
+            count = conn.execute(f'SELECT COUNT(*) c FROM "{t}"').fetchone()["c"]
+            cards += (
+                f'<div class="card"><a href="/admin/table/{t}"><strong>{html.escape(t)}</strong></a>'
+                f" — {count} записей</div>"
+            )
+    return admin_page("Админка · gym-diary", f"<h2>Таблицы</h2>{cards}")
+
+
+@app.get("/admin/table/{table}", response_class=HTMLResponse, include_in_schema=False)
+def admin_table_view(table: str, page: int = 1, _: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        cols = _table_columns(conn, table)
+        total = conn.execute(f'SELECT COUNT(*) c FROM "{table}"').fetchone()["c"]
+        page = max(page, 1)
+        offset = (page - 1) * ADMIN_PAGE_SIZE
+        rows = conn.execute(
+            f'SELECT rowid AS _rowid, * FROM "{table}" ORDER BY rowid DESC LIMIT ? OFFSET ?',
+            (ADMIN_PAGE_SIZE, offset)
+        ).fetchall()
+
+    thead = "".join(f"<th>{html.escape(c)}</th>" for c in cols) + "<th></th>"
+    trs = ""
+    for r in rows:
+        tds = "".join(
+            f"<td>{html.escape(str(r[c])) if r[c] is not None else ''}</td>" for c in cols
+        )
+        rid = r["_rowid"]
+        actions = (
+            '<div class="actions">'
+            f'<a class="btn ghost" href="/admin/table/{table}/edit/{rid}">Изм.</a>'
+            f'<form method="post" action="/admin/table/{table}/delete/{rid}" '
+            f"onsubmit=\"return confirm('Удалить запись?')\">"
+            '<button class="btn danger" type="submit">Удалить</button></form>'
+            "</div>"
+        )
+        trs += f"<tr>{tds}<td>{actions}</td></tr>"
+
+    pages = max((total - 1) // ADMIN_PAGE_SIZE + 1, 1)
+    pager = f'<div class="pager"><span>Стр. {page} из {pages} · {total} записей</span>'
+    if page > 1:
+        pager += f'<a class="btn ghost" href="?page={page-1}">← Назад</a>'
+    if page < pages:
+        pager += f'<a class="btn ghost" href="?page={page+1}">Вперёд →</a>'
+    pager += "</div>"
+
+    body = (
+        f'<a class="btn" href="/admin/table/{table}/new">+ Новая запись</a>'
+        f'<div style="height:16px"></div>{pager}'
+        f"<table><thead><tr>{thead}</tr></thead><tbody>{trs}</tbody></table>{pager}"
+    )
+    return admin_page(f"Таблица: {table}", body)
+
+
+@app.get("/admin/table/{table}/new", response_class=HTMLResponse, include_in_schema=False)
+def admin_row_new_form(table: str, _: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        cols = _table_columns(conn, table)
+
+    fields = "".join(
+        f'<div class="field"><label>{html.escape(c)}</label><input name="{html.escape(c)}"></div>'
+        for c in cols
+    )
+    body = (
+        f'<form method="post" action="/admin/table/{table}/new">{fields}'
+        '<button class="btn" type="submit">Создать</button> '
+        f'<a class="btn ghost" href="/admin/table/{table}">Отмена</a></form>'
+        '<div style="height:12px"></div>'
+        '<p style="color:#555;font-size:12px">Пустые поля не отправляются — так автоинкрементные id остаются пустыми и подставляются сами.</p>'
+    )
+    return admin_page(f"Новая запись · {table}", body)
+
+
+@app.post("/admin/table/{table}/new", response_class=HTMLResponse, include_in_schema=False)
+async def admin_row_new_submit(table: str, request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        cols = _table_columns(conn, table)
+        cols_present = [c for c in cols if (form.get(c) or "") != ""] or cols
+        col_list = ", ".join(f'"{c}"' for c in cols_present)
+        placeholders = ", ".join("?" for _ in cols_present)
+        values = [form.get(c, "") for c in cols_present]
+        try:
+            conn.execute(f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})', values)
+        except sqlite3.Error as e:
+            return admin_page(f"Новая запись · {table}", f'<div class="err">Ошибка: {html.escape(str(e))}</div>'
+                               f'<a class="btn ghost" href="/admin/table/{table}/new">Назад</a>')
+    return RedirectResponse(f"/admin/table/{table}", status_code=303)
+
+
+@app.get("/admin/table/{table}/edit/{rowid}", response_class=HTMLResponse, include_in_schema=False)
+def admin_row_edit_form(table: str, rowid: int, _: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        cols = _table_columns(conn, table)
+        row = conn.execute(f'SELECT rowid AS _rowid, * FROM "{table}" WHERE rowid=?', (rowid,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Запись не найдена")
+
+    fields = ""
+    for c in cols:
+        val = row[c] if row[c] is not None else ""
+        sval = html.escape(str(val))
+        if isinstance(val, str) and len(val) > 60:
+            fields += f'<div class="field"><label>{html.escape(c)}</label><textarea name="{html.escape(c)}" rows="4">{sval}</textarea></div>'
+        else:
+            fields += f'<div class="field"><label>{html.escape(c)}</label><input name="{html.escape(c)}" value="{sval}"></div>'
+
+    body = (
+        f'<form method="post" action="/admin/table/{table}/edit/{rowid}">{fields}'
+        '<button class="btn" type="submit">Сохранить</button> '
+        f'<a class="btn ghost" href="/admin/table/{table}">Отмена</a></form>'
+    )
+    return admin_page(f"Изменить запись · {table}", body)
+
+
+@app.post("/admin/table/{table}/edit/{rowid}", response_class=HTMLResponse, include_in_schema=False)
+async def admin_row_edit_submit(table: str, rowid: int, request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        cols = _table_columns(conn, table)
+        set_clause = ", ".join(f'"{c}"=?' for c in cols)
+        values = [form.get(c, "") for c in cols] + [rowid]
+        try:
+            conn.execute(f'UPDATE "{table}" SET {set_clause} WHERE rowid=?', values)
+        except sqlite3.Error as e:
+            return admin_page(f"Изменить запись · {table}", f'<div class="err">Ошибка: {html.escape(str(e))}</div>'
+                               f'<a class="btn ghost" href="/admin/table/{table}/edit/{rowid}">Назад</a>')
+    return RedirectResponse(f"/admin/table/{table}", status_code=303)
+
+
+@app.post("/admin/table/{table}/delete/{rowid}", include_in_schema=False)
+def admin_row_delete(table: str, rowid: int, _: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        if not _valid_table(conn, table):
+            raise HTTPException(404, "Таблицы не существует")
+        conn.execute(f'DELETE FROM "{table}" WHERE rowid=?', (rowid,))
+    return RedirectResponse(f"/admin/table/{table}", status_code=303)
+
+
+ADMIN_SQL_WARNING = (
+    '<div class="warn">Выполняется прямо на базе. Изменяющие запросы '
+    "(UPDATE/DELETE/INSERT) применяются сразу и без подтверждения — будь аккуратен, "
+    "особенно без WHERE.</div>"
+)
+
+
+@app.get("/admin/sql", response_class=HTMLResponse, include_in_schema=False)
+def admin_sql_form(_: bool = Depends(verify_admin)):
+    body = (
+        ADMIN_SQL_WARNING
+        + '<form method="post" action="/admin/sql">'
+        + '<textarea name="query" rows="6" placeholder="SELECT * FROM workouts LIMIT 20"></textarea>'
+        + '<button class="btn" type="submit">Выполнить</button></form>'
+    )
+    return admin_page("SQL-запрос", body)
+
+
+@app.post("/admin/sql", response_class=HTMLResponse, include_in_schema=False)
+async def admin_sql_run(request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    query = (form.get("query") or "").strip()
+    result_html = ""
+    if query:
+        try:
+            with get_db() as conn:
+                cur = conn.execute(query)
+                if cur.description:
+                    rows = cur.fetchall()
+                    cols = [d[0] for d in cur.description]
+                    thead = "".join(f"<th>{html.escape(c)}</th>" for c in cols)
+                    trs = "".join(
+                        "<tr>" + "".join(
+                            f"<td>{html.escape(str(v)) if v is not None else ''}</td>" for v in r
+                        ) + "</tr>"
+                        for r in rows
+                    )
+                    result_html = (
+                        f'<div class="ok">{len(rows)} строк</div>'
+                        f"<table><thead><tr>{thead}</tr></thead><tbody>{trs}</tbody></table>"
+                    )
+                else:
+                    result_html = f'<div class="ok">Выполнено. Изменено строк: {cur.rowcount}</div>'
+        except Exception as e:
+            result_html = f'<div class="err">Ошибка: {html.escape(str(e))}</div>'
+
+    body = (
+        ADMIN_SQL_WARNING
+        + f'<form method="post" action="/admin/sql"><textarea name="query" rows="6">{html.escape(query)}</textarea>'
+        + '<button class="btn" type="submit">Выполнить</button></form>'
+        + f'<div style="height:16px"></div>{result_html}'
+    )
+    return admin_page("SQL-запрос", body)
+
+
+@app.get("/admin/db/download", include_in_schema=False)
+def admin_db_download(_: bool = Depends(verify_admin)):
+    if not os.path.exists(DB_PATH):
+        raise HTTPException(404, "Файл базы не найден")
+    with get_db() as conn:
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+    return FileResponse(DB_PATH, filename="gym.db", media_type="application/octet-stream")
+
+
+@app.get("/admin/db/upload", response_class=HTMLResponse, include_in_schema=False)
+def admin_db_upload_form(_: bool = Depends(verify_admin)):
+    body = (
+        '<div class="warn">Загрузка полностью заменит текущую базу данных новым файлом. '
+        "Старая версия автоматически сохранится рядом (файл с суффиксом .bak-&lt;время&gt;), "
+        "если понадобится откатиться.</div>"
+        '<form method="post" action="/admin/db/upload" enctype="multipart/form-data">'
+        '<input type="file" name="file" accept=".db,.sqlite,.sqlite3" required>'
+        '<button class="btn danger" type="submit">Заменить базу</button></form>'
+    )
+    return admin_page("Загрузить базу", body)
+
+
+@app.post("/admin/db/upload", response_class=HTMLResponse, include_in_schema=False)
+async def admin_db_upload_submit(file: UploadFile = File(...), _: bool = Depends(verify_admin)):
+    content = await file.read()
+    if content[:16] != b"SQLite format 3\x00":
+        return admin_page(
+            "Загрузить базу",
+            '<div class="err">Файл не похож на базу SQLite — ничего не изменено.</div>'
+            '<a class="btn ghost" href="/admin/db/upload">Назад</a>',
+        )
+
+    backup_path = f"{DB_PATH}.bak-{int(time.time())}"
+    if os.path.exists(DB_PATH):
+        shutil.copy(DB_PATH, backup_path)
+    with open(DB_PATH, "wb") as f:
+        f.write(content)
+
+    body = (
+        f'<div class="ok">База заменена. Резервная копия старой версии: {html.escape(backup_path)}</div>'
+        '<a class="btn" href="/admin">К дашборду</a>'
+    )
+    return admin_page("Готово", body)

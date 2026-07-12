@@ -9,11 +9,11 @@ FastAPI + SQLite
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3, json, hmac, hashlib, urllib.parse, os, secrets, shutil, time, html
+import sqlite3, json, hmac, hashlib, urllib.parse, os, secrets, shutil, time, html, datetime
 
 app = FastAPI()
 
@@ -510,6 +510,99 @@ def activate_profile(profile_id: int, x_init_data: str = Header(...)):
             raise HTTPException(404, "Профиль не найден")
         conn.execute("UPDATE users SET active_profile_id=? WHERE user_id=?", (profile_id, uid))
     return {"ok": True}
+
+
+# Те же подписи полей замеров, что и во фронтенде (App.jsx → MEASUREMENT_FIELDS),
+# используются только для читаемого текстового экспорта.
+_MEASUREMENT_FIELD_LABELS = {
+    "weight": "Вес тела", "waist": "Талия", "chest": "Грудь", "shoulders": "Плечи",
+    "armRight": "Правая рука", "armLeft": "Левая рука",
+    "forearmRight": "Правое предплечье", "forearmLeft": "Левое предплечье",
+    "glutes": "Ягодицы", "quadRight": "Правый квадрицепс", "quadLeft": "Левый квадрицепс",
+    "calfRight": "Правая икра", "calfLeft": "Левая икра",
+}
+
+
+def _fmt_date_ru(iso: str) -> str:
+    try:
+        y, m, d = iso.split("-")
+        return f"{d}.{m}.{y}"
+    except Exception:
+        return iso
+
+
+def _fmt_set_line(s: dict):
+    if s.get("bilateral"):
+        wl, rl = s.get("weightL") or "—", s.get("repsL") or "—"
+        wr, rr = s.get("weightR") or "—", s.get("repsR") or "—"
+        if not any([s.get("weightL"), s.get("repsL"), s.get("weightR"), s.get("repsR")]):
+            return None
+        return f"Л {wl} кг × {rl}  ·  П {wr} кг × {rr}"
+    w, r = s.get("weight"), s.get("reps")
+    if not (w or r):
+        return None
+    return f"{w or '—'} кг × {r or '—'} повт"
+
+
+def _build_profile_export(profile_name: str, workout_rows, measurement_rows) -> str:
+    lines = [
+        f"ДНЕВНИК ТРЕНИРОВОК — {profile_name}",
+        f"Экспорт от {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}",
+        "",
+        "=" * 40,
+        f"ТРЕНИРОВКИ ({len(workout_rows)})",
+        "=" * 40,
+        "",
+    ]
+
+    for w in sorted(workout_rows, key=lambda r: (r["date"], r["id"])):
+        exercises = json.loads(w["exercises"])
+        lines.append(f"{_fmt_date_ru(w['date'])} · {w['name']}")
+        for i, ex in enumerate(exercises, 1):
+            lines.append(f"  {i}. {ex.get('name') or f'Упражнение {i}'}")
+            for si, s in enumerate(ex.get("sets", []), 1):
+                fs = _fmt_set_line(s)
+                if fs:
+                    lines.append(f"     {si}) {fs}")
+            comment = (ex.get("comment") or "").strip()
+            if comment:
+                lines.append(f"     Комментарий: {comment}")
+        lines += ["", "-" * 40, ""]
+
+    lines += ["=" * 40, f"ЗАМЕРЫ ({len(measurement_rows)})", "=" * 40, ""]
+
+    for m in sorted(measurement_rows, key=lambda r: (r["date"], r["id"])):
+        data = json.loads(m["data"])
+        lines.append(f"{_fmt_date_ru(m['date'])} · {m['name']}")
+        filled = False
+        for key, label in _MEASUREMENT_FIELD_LABELS.items():
+            val = data.get(key)
+            if val not in (None, ""):
+                unit = "кг" if key == "weight" else "см"
+                lines.append(f"  {label}: {val} {unit}")
+                filled = True
+        if not filled:
+            lines.append("  (ничего не заполнено)")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@app.get("/profiles/{profile_id}/export")
+def export_profile(profile_id: int, x_init_data: str = Header(...)):
+    """Текстовый экспорт всех тренировок и замеров конкретного профиля (не только активного)."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        profile = conn.execute(
+            "SELECT * FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid)
+        ).fetchone()
+        if not profile:
+            raise HTTPException(404, "Профиль не найден")
+        workout_rows = conn.execute("SELECT * FROM workouts WHERE profile_id=?", (profile_id,)).fetchall()
+        measurement_rows = conn.execute("SELECT * FROM measurements WHERE profile_id=?", (profile_id,)).fetchall()
+
+    text = _build_profile_export(profile["name"], workout_rows, measurement_rows)
+    return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
 
 
 # ── Роуты: друзья ──────────────────────────────────────────────────────────────

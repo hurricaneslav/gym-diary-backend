@@ -544,7 +544,7 @@ def _fmt_set_line(s: dict):
     return f"{w or '—'} кг × {r or '—'} повт"
 
 
-def _build_profile_export(profile_name: str, workout_rows, measurement_rows) -> str:
+def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exercise_notes: dict) -> str:
     lines = [
         f"ДНЕВНИК ТРЕНИРОВОК — {profile_name}",
         f"Экспорт от {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -555,11 +555,15 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows) -> 
         "",
     ]
 
+    all_exercise_names = set()
     for w in sorted(workout_rows, key=lambda r: (r["date"], r["id"])):
         exercises = json.loads(w["exercises"])
         lines.append(f"{_fmt_date_ru(w['date'])} · {w['name']}")
         for i, ex in enumerate(exercises, 1):
-            lines.append(f"  {i}. {ex.get('name') or f'Упражнение {i}'}")
+            ex_name = (ex.get("name") or f"Упражнение {i}").strip()
+            if ex_name:
+                all_exercise_names.add(ex_name)
+            lines.append(f"  {i}. {ex_name}")
             for si, s in enumerate(ex.get("sets", []), 1):
                 fs = _fmt_set_line(s)
                 if fs:
@@ -585,24 +589,82 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows) -> 
             lines.append("  (ничего не заполнено)")
         lines.append("")
 
+    sorted_names = sorted(all_exercise_names, key=lambda s: s.lower())
+    lines += ["=" * 40, f"УПРАЖНЕНИЯ ({len(sorted_names)})", "=" * 40, ""]
+    for name in sorted_names:
+        lines.append(f"• {name}")
+        note = (exercise_notes.get(name.strip().lower()) or "").strip()
+        if note:
+            lines.append(f"  {note}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
-@app.get("/profiles/{profile_id}/export")
-def export_profile(profile_id: int, x_init_data: str = Header(...)):
-    """Текстовый экспорт всех тренировок и замеров конкретного профиля (не только активного)."""
+# Токены для скачивания файла экспорта: Telegram.WebApp.downloadFile() на телефонах
+# (это единственный способ реально сохранить файл в Telegram-webview на iOS — обычная
+# Blob-ссылка там просто открывает файл на просмотр, без сохранения/копирования)
+# делает запрос сам, без наших заголовков авторизации x-init-data. Поэтому даём
+# отдельную короткоживущую ссылку с одноразовым токеном вместо заголовка.
+_EXPORT_TOKEN_TTL = 300  # 5 минут
+_export_tokens = {}
+
+
+def _cleanup_export_tokens():
+    now = time.time()
+    for t in [t for t, v in _export_tokens.items() if v["expires"] < now]:
+        _export_tokens.pop(t, None)
+
+
+@app.post("/profiles/{profile_id}/export-token")
+def create_export_token(profile_id: int, x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
     with get_db() as conn:
-        profile = conn.execute(
-            "SELECT * FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid)
-        ).fetchone()
+        row = conn.execute("SELECT id FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid)).fetchone()
+        if not row:
+            raise HTTPException(404, "Профиль не найден")
+    _cleanup_export_tokens()
+    token = secrets.token_urlsafe(24)
+    _export_tokens[token] = {"profile_id": profile_id, "expires": time.time() + _EXPORT_TOKEN_TTL}
+    return {"token": token}
+
+
+@app.get("/profiles/{profile_id}/export")
+def export_profile(profile_id: int, token: Optional[str] = None, x_init_data: Optional[str] = Header(None)):
+    """Текстовый экспорт всех тренировок, замеров и упражнений конкретного профиля
+    (не только активного). Авторизация — либо обычным заголовком x-init-data
+    (прямой fetch из браузера), либо одноразовым токеном в query (для
+    Telegram.WebApp.downloadFile, который сам делает запрос без заголовков)."""
+    if token:
+        _cleanup_export_tokens()
+        entry = _export_tokens.get(token)
+        if not entry or entry["profile_id"] != profile_id or entry["expires"] < time.time():
+            raise HTTPException(403, "Ссылка для скачивания недействительна или устарела")
+    else:
+        if not x_init_data:
+            raise HTTPException(401, "Требуется авторизация")
+        uid = get_user_id(x_init_data)
+        with get_db() as conn:
+            row = conn.execute("SELECT id FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid)).fetchone()
+            if not row:
+                raise HTTPException(404, "Профиль не найден")
+
+    with get_db() as conn:
+        profile = conn.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
         if not profile:
             raise HTTPException(404, "Профиль не найден")
         workout_rows = conn.execute("SELECT * FROM workouts WHERE profile_id=?", (profile_id,)).fetchall()
         measurement_rows = conn.execute("SELECT * FROM measurements WHERE profile_id=?", (profile_id,)).fetchall()
+        note_rows = conn.execute(
+            "SELECT name_lc, note FROM exercise_notes WHERE profile_id=?", (profile_id,)
+        ).fetchall()
+        exercise_notes = {r["name_lc"]: r["note"] for r in note_rows}
 
-    text = _build_profile_export(profile["name"], workout_rows, measurement_rows)
-    return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
+    text = _build_profile_export(profile["name"], workout_rows, measurement_rows, exercise_notes)
+    ascii_name = "workout-export.txt"
+    utf8_name = urllib.parse.quote(f'{profile["name"]}.txt')
+    headers = {"Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_name}"}
+    return PlainTextResponse(text, media_type="text/plain; charset=utf-8", headers=headers)
 
 
 # ── Роуты: друзья ──────────────────────────────────────────────────────────────

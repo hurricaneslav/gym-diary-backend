@@ -143,6 +143,58 @@ def init_db():
                 note       TEXT NOT NULL DEFAULT '',
                 UNIQUE(profile_id, name_lc)
             );
+            CREATE TABLE IF NOT EXISTS progressions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id       INTEGER NOT NULL,
+                exercise_name    TEXT NOT NULL,
+                exercise_name_lc TEXT NOT NULL,
+                mode             TEXT NOT NULL DEFAULT 'calculated',
+                status           TEXT NOT NULL DEFAULT 'active',
+
+                exercise_type    TEXT,
+                goal             TEXT,
+                rep_unit         TEXT NOT NULL DEFAULT 'reps',
+                rep_range_low    INTEGER,
+                rep_range_high   INTEGER,
+                frequency        INTEGER,
+                sets_count       INTEGER,
+                increment        REAL,
+
+                start_weight     REAL,
+                start_reps       INTEGER,
+                start_rir        REAL,
+                total_sessions   INTEGER,
+                deload_enabled   INTEGER NOT NULL DEFAULT 0,
+
+                current_weight   REAL,
+                current_reps     INTEGER,
+                fail_streak      INTEGER NOT NULL DEFAULT 0,
+
+                created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_progressions_active_unique
+                ON progressions(profile_id, exercise_name_lc) WHERE status = 'active';
+            CREATE TABLE IF NOT EXISTS progression_sessions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                progression_id  INTEGER NOT NULL,
+                session_index   INTEGER NOT NULL,
+                role            TEXT,
+
+                planned_weight  REAL NOT NULL,
+                planned_reps    INTEGER NOT NULL,
+                planned_sets    INTEGER NOT NULL,
+
+                status          TEXT NOT NULL DEFAULT 'pending',
+                workout_id      INTEGER,
+                actual_weight   REAL,
+                actual_reps     INTEGER,
+                actual_sets     INTEGER,
+                actual_rir      REAL,
+                completed_at    TEXT,
+
+                UNIQUE(progression_id, session_index)
+            );
         """)
         # Миграция: добавляем profile_id в старые таблицы, если его ещё нет
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(workouts)").fetchall()]
@@ -154,6 +206,9 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
         if "show_measurements" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN show_measurements INTEGER NOT NULL DEFAULT 1")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "is_premium" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0")
 
         migrate_legacy_data(conn)
 
@@ -221,6 +276,104 @@ def normalize_pair(a: str, b: str):
     return (a, b) if a < b else (b, a)
 
 
+# ── Прогрессия: чистые расчётные функции ─────────────────────────────────────
+# Никакого состояния и никаких обращений к БД — только математика. Специально
+# отделены от роутов, чтобы их можно было прогнать на фейковых данных без
+# поднятия сервера (см. tests в конце файла / отдельный тест-скрипт).
+
+VARYING_TYPES = ("main_compound", "accessory_compound")  # у этих типов есть роли heavy/light/medium/volume
+ROLE_TEMPLATES = {
+    1: ["heavy"],
+    2: ["heavy", "light"],
+    3: ["heavy", "light", "medium"],
+    4: ["heavy", "medium", "light", "volume"],
+}
+ROLE_WEIGHT_PCT = {"light": 0.10, "medium": 0.05, "volume": 0.12}  # снижение веса от heavy-цели недели
+
+
+def round_to_increment(weight: float, increment: float) -> float:
+    if not increment:
+        return weight
+    return round(round(weight / increment) * increment, 3)
+
+
+def climb(weight: float, reps: int, low: int, high: int, increment: float):
+    """Шаг двойной прогрессии: набираем повторы на одном весе, затем вес вверх и повторы к низу диапазона."""
+    if reps < high:
+        return weight, reps + 1
+    return round_to_increment(weight + increment, increment), low
+
+
+def normalize_overflow(weight: float, reps: int, low: int, high: int, increment: float):
+    """Если факт превысил верх диапазона повторов — "перевыполнение" превращается в шаги веса."""
+    span = high - low + 1
+    while reps > high:
+        reps -= span
+        weight = round_to_increment(weight + increment, increment)
+    if reps < low:
+        reps = low
+    return weight, reps
+
+
+def role_template(exercise_type: str, frequency: int):
+    if exercise_type in VARYING_TYPES:
+        return ROLE_TEMPLATES.get(max(1, min(frequency or 1, 4)), ROLE_TEMPLATES[1])
+    return [None]  # изоляция/изометрия/произвольное — без вариации по дням, каждая сессия "как heavy"
+
+
+def role_adjust(role: str, anchor_weight: float, anchor_reps: int, sets_count: int, increment: float):
+    """Вес/подходы для light/medium/volume-сессии недели, от heavy-цели этой же недели (anchor)."""
+    pct = ROLE_WEIGHT_PCT.get(role, 0.0)
+    w = round_to_increment(anchor_weight * (1 - pct), increment)
+    sets = sets_count + 1 if role == "volume" else sets_count
+    return w, anchor_reps, sets
+
+
+def generate_remaining_sessions(exercise_type, frequency, low, high, increment, sets_count,
+                                 total_sessions, from_index, anchor_weight, anchor_reps):
+    """
+    Строит план сессий от from_index (включительно) до total_sessions, начиная с состояния
+    (anchor_weight, anchor_reps) — это цель ближайшей heavy/"стандартной" сессии. Роль каждого
+    индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне (не сдвигается при перегенерации),
+    поэтому пересчёт с середины недели не путает фазу light/medium/volume.
+    Возвращает список кортежей (session_index, role, planned_weight, planned_reps, planned_sets).
+    """
+    template = role_template(exercise_type, frequency)
+    freq = len(template)
+    w, r = anchor_weight, anchor_reps
+    out = []
+    for idx in range(from_index, total_sessions + 1):
+        phase = (idx - 1) % freq
+        if idx > from_index and phase == 0:
+            w, r = climb(w, r, low, high, increment)
+        role = template[phase]
+        if role in (None, "heavy"):
+            out.append((idx, role, w, r, sets_count))
+        else:
+            aw, ar, asets = role_adjust(role, w, r, sets_count, increment)
+            out.append((idx, role, aw, ar, asets))
+    return out
+
+
+def adapt_actual(planned_weight, planned_reps, planned_sets, actual_weight, actual_reps, actual_sets,
+                  low, high, increment, prior_fail_streak: int):
+    """
+    По факту одной heavy/"стандартной" сессии решает новую точку (anchor_weight, anchor_reps),
+    от которой будут перегенерированы все дальнейшие сессии, и новый fail_streak.
+    """
+    if actual_sets is not None and planned_sets and actual_sets < planned_sets:
+        # не выполнил весь плановый объём — не даём сработать "опережающей" ветке
+        return actual_weight, actual_reps, 0
+    if actual_reps < low and actual_weight == planned_weight:
+        if prior_fail_streak >= 1:
+            # второй провал подряд на этом весе — автоделоад
+            return round_to_increment(actual_weight * 0.9, increment), low, 0
+        # первый провал — повторяем ту же цель ещё раз, без изменений
+        return planned_weight, planned_reps, prior_fail_streak + 1
+    w, r = normalize_overflow(actual_weight, actual_reps, low, high, increment)
+    return w, r, 0
+
+
 # ── Модели ────────────────────────────────────────────────────────────────────
 
 class WorkoutIn(BaseModel):
@@ -259,6 +412,57 @@ class ExerciseNoteIn(BaseModel):
 class ExerciseNoteRenameIn(BaseModel):
     old_name: str
     new_name: str
+
+class ManualSessionIn(BaseModel):
+    weight: float
+    reps: int
+    sets: int
+
+class ProgressionCreateIn(BaseModel):
+    exercise_name:  str
+    mode:           str                       # 'manual' | 'calculated'
+    # calculated:
+    exercise_type:  Optional[str] = None       # main_compound|accessory_compound|isolation|isometric|custom
+    goal:           Optional[str] = None       # strength|hypertrophy|strength_hypertrophy
+    rep_unit:       str = "reps"               # reps|seconds
+    rep_range_low:  Optional[int] = None
+    rep_range_high: Optional[int] = None
+    frequency:      Optional[int] = None
+    sets_count:     Optional[int] = None
+    increment:      Optional[float] = None
+    start_weight:   Optional[float] = None
+    start_reps:     Optional[int] = None
+    start_rir:      Optional[float] = None
+    weeks:          Optional[int] = None       # длительность цикла в неделях (total_sessions = weeks*frequency)
+    deload_enabled: bool = False
+    # manual:
+    manual_sessions: list[ManualSessionIn] = []
+
+class ProgressionEditIn(BaseModel):
+    goal:           Optional[str] = None
+    rep_range_low:  Optional[int] = None
+    rep_range_high: Optional[int] = None
+    frequency:      Optional[int] = None
+    sets_count:     Optional[int] = None
+    increment:      Optional[float] = None
+    deload_enabled: Optional[bool] = None
+
+class SessionLogIn(BaseModel):
+    actual_weight: float
+    actual_reps:   int
+    actual_sets:   int
+    actual_rir:    Optional[float] = None
+    workout_id:    Optional[int] = None
+
+class NewCycleIn(BaseModel):
+    weeks:          Optional[int] = None
+    goal:           Optional[str] = None
+    rep_range_low:  Optional[int] = None
+    rep_range_high: Optional[int] = None
+    frequency:      Optional[int] = None
+    sets_count:     Optional[int] = None
+    increment:      Optional[float] = None
+    deload_enabled: Optional[bool] = None
 
 
 # ── Роуты: тренировки ─────────────────────────────────────────────────────────
@@ -419,6 +623,18 @@ def rename_exercise_note(body: ExerciseNoteRenameIn, x_init_data: str = Header(.
                 "UPDATE exercise_notes SET name_lc=? WHERE profile_id=? AND name_lc=?",
                 (new_lc, pid, old_lc)
             )
+        # Прогрессии ищут совпадение тренировок по exercise_name_lc — без этого
+        # переименование "отвязывает" прогрессию от будущих тренировок. Если под
+        # новым именем уже есть своя активная прогрессия — конфликт частичного
+        # уникального индекса; переименование заметки при этом всё равно должно
+        # пройти, поэтому глушим только эту часть.
+        try:
+            conn.execute(
+                "UPDATE progressions SET exercise_name=?, exercise_name_lc=? WHERE profile_id=? AND exercise_name_lc=?",
+                (body.new_name.strip(), new_lc, pid, old_lc)
+            )
+        except sqlite3.IntegrityError:
+            pass
     return {"ok": True}
 
 
@@ -544,7 +760,41 @@ def _fmt_set_line(s: dict):
     return f"{w or '—'} кг × {r or '—'} повт"
 
 
-def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exercise_notes: dict) -> str:
+def _fmt_progression_role(role):
+    return {"heavy": "Тяжёлая", "light": "Лёгкая", "medium": "Средняя", "volume": "Объёмная"}.get(role, "")
+
+
+def _fmt_progression_session_line(s: dict, rep_unit: str) -> str:
+    unit = "сек" if rep_unit == "seconds" else "повт"
+    role = f" ({_fmt_progression_role(s['role'])})" if s.get("role") else ""
+    plan = f"План: {s['planned_weight']} кг × {s['planned_reps']} {unit} × {s['planned_sets']} подх{role}"
+    if s["status"] == "done":
+        fact = f"Факт: {s['actual_weight']} кг × {s['actual_reps']} {unit} × {s['actual_sets']} подх"
+        return f"{plan}  →  {fact}"
+    if s["status"] == "skipped":
+        return f"{plan}  →  пропущена"
+    return f"{plan}  →  ещё не выполнена"
+
+
+def _build_progression_export(progression_rows_with_sessions) -> list:
+    lines = []
+    for prog, sessions in progression_rows_with_sessions:
+        status = {"active": "активна", "completed": "завершена", "archived": "в архиве"}.get(prog["status"], prog["status"])
+        mode = "произвольная" if prog["mode"] == "manual" else "расчётная"
+        lines.append(f"• {prog['exercise_name']} — {mode}, {status}")
+        if prog["mode"] == "calculated":
+            goal_label = {"strength": "сила", "hypertrophy": "гипертрофия",
+                          "strength_hypertrophy": "сила+гипертрофия"}.get(prog["goal"], prog["goal"] or "—")
+            lines.append(f"  Цель: {goal_label}  ·  диапазон {prog['rep_range_low']}–{prog['rep_range_high']}  ·  шаг {prog['increment']} кг")
+        for s in sessions:
+            lines.append(f"  {s['session_index']}. {_fmt_progression_session_line(s, prog['rep_unit'] or 'reps')}")
+        lines.append("")
+    return lines
+
+
+
+def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exercise_notes: dict,
+                           progression_rows_with_sessions=None) -> str:
     lines = [
         f"ДНЕВНИК ТРЕНИРОВОК — {profile_name}",
         f"Экспорт от {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -608,6 +858,10 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
                 lines.append(f"      Комментарий: {comment}")
         lines.append("")
 
+    if progression_rows_with_sessions:
+        lines += ["=" * 40, f"ПРОГРЕССИИ ({len(progression_rows_with_sessions)})", "=" * 40, ""]
+        lines += _build_progression_export(progression_rows_with_sessions)
+
     return "\n".join(lines)
 
 
@@ -666,7 +920,17 @@ def _profile_export_data(profile_id: int, uid: str):
             "SELECT name_lc, note FROM exercise_notes WHERE profile_id=?", (profile_id,)
         ).fetchall()
         exercise_notes = {r["name_lc"]: r["note"] for r in note_rows}
-    text = _build_profile_export(profile["name"], workout_rows, measurement_rows, exercise_notes)
+        progression_rows = conn.execute(
+            "SELECT * FROM progressions WHERE profile_id=? ORDER BY id", (profile_id,)
+        ).fetchall()
+        progressions_with_sessions = []
+        for prog in progression_rows:
+            sessions = conn.execute(
+                "SELECT * FROM progression_sessions WHERE progression_id=? ORDER BY session_index", (prog["id"],)
+            ).fetchall()
+            progressions_with_sessions.append((prog, sessions))
+    text = _build_profile_export(profile["name"], workout_rows, measurement_rows, exercise_notes,
+                                  progressions_with_sessions)
     return profile["name"], text
 
 
@@ -851,6 +1115,397 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
     }
 
 
+# ── Роуты: прогрессия ────────────────────────────────────────────────────────
+# Премиум-фича: доступ только тем, у кого users.is_premium=1 (выдаётся через
+# /admin/premium). Расчётная логика — чистые функции выше (round_to_increment,
+# climb, normalize_overflow, generate_remaining_sessions, adapt_actual),
+# роуты только читают/пишут БД и вызывают их.
+
+def _require_premium(conn, uid: str):
+    row = conn.execute("SELECT is_premium FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not row or not row["is_premium"]:
+        raise HTTPException(403, "Раздел «Прогрессия» доступен премиум-пользователям")
+
+
+def _get_owned_progression(conn, pid: int, progression_id: int):
+    row = conn.execute(
+        "SELECT * FROM progressions WHERE id=? AND profile_id=?", (progression_id, pid)
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Прогрессия не найдена")
+    return row
+
+
+def _serialize_progression(row) -> dict:
+    d = dict(row)
+    d["deload_enabled"] = bool(d.get("deload_enabled"))
+    return d
+
+
+def _serialize_session(row) -> dict:
+    return dict(row)
+
+
+def _maybe_complete(conn, progression_id: int):
+    """Если все сессии done/skipped — цикл завершён."""
+    left = conn.execute(
+        "SELECT COUNT(*) c FROM progression_sessions WHERE progression_id=? AND status='pending'",
+        (progression_id,)
+    ).fetchone()["c"]
+    if left == 0:
+        conn.execute("UPDATE progressions SET status='completed', updated_at=datetime('now') WHERE id=? AND status='active'",
+                     (progression_id,))
+
+
+def _insert_sessions(conn, progression_id: int, sessions):
+    conn.executemany(
+        "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets) "
+        "VALUES (?,?,?,?,?,?)",
+        [(progression_id, idx, role, w, r, s) for idx, role, w, r, s in sessions]
+    )
+
+
+@app.get("/me/premium")
+def get_my_premium(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        row = conn.execute("SELECT is_premium FROM users WHERE user_id=?", (uid,)).fetchone()
+    return {"is_premium": bool(row and row["is_premium"])}
+
+
+@app.get("/progressions")
+def list_progressions(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        rows = conn.execute(
+            "SELECT * FROM progressions WHERE profile_id=? AND status!='archived' ORDER BY id DESC", (pid,)
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = _serialize_progression(r)
+            counts = conn.execute(
+                "SELECT COUNT(*) total, SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) done "
+                "FROM progression_sessions WHERE progression_id=?", (r["id"],)
+            ).fetchone()
+            d["sessions_total"] = counts["total"]
+            d["sessions_done"] = counts["done"] or 0
+            nxt = conn.execute(
+                "SELECT * FROM progression_sessions WHERE progression_id=? AND status='pending' "
+                "ORDER BY session_index LIMIT 1", (r["id"],)
+            ).fetchone()
+            d["next_session"] = _serialize_session(nxt) if nxt else None
+            result.append(d)
+    return result
+
+
+@app.post("/progressions")
+def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    name = body.exercise_name.strip()
+    name_lc = name.lower()
+    if not name:
+        raise HTTPException(400, "Пустое название упражнения")
+
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+
+        if body.mode == "manual":
+            if not body.manual_sessions:
+                raise HTTPException(400, "Нужна хотя бы одна сессия плана")
+            total_sessions = len(body.manual_sessions)
+            try:
+                cur = conn.execute(
+                    "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, total_sessions) "
+                    "VALUES (?,?,?,'manual','active',?)",
+                    (pid, name, name_lc, total_sessions)
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
+            new_id = cur.lastrowid
+            sessions = [(i, None, s.weight, s.reps, s.sets) for i, s in enumerate(body.manual_sessions, 1)]
+            _insert_sessions(conn, new_id, sessions)
+            return {"ok": True, "id": new_id}
+
+        # calculated
+        required = [body.exercise_type, body.goal, body.rep_range_low, body.rep_range_high,
+                    body.frequency, body.sets_count, body.increment, body.start_weight,
+                    body.start_reps, body.weeks]
+        if any(v is None for v in required):
+            raise HTTPException(400, "Не заполнены все обязательные поля расчётной прогрессии")
+        if body.rep_range_high <= body.rep_range_low:
+            raise HTTPException(400, "Верх диапазона повторов должен быть больше низа")
+        if body.increment <= 0 or body.sets_count < 1 or body.weeks < 1 or body.frequency < 1:
+            raise HTTPException(400, "Некорректные числовые параметры")
+        if body.exercise_type in VARYING_TYPES and body.frequency not in (1, 2, 3, 4):
+            raise HTTPException(400, "Для этого типа упражнения частота — от 1 до 4 раз в неделю")
+
+        total_sessions = body.weeks * body.frequency
+        try:
+            cur = conn.execute(
+                "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
+                "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
+                "increment, start_weight, start_reps, start_rir, total_sessions, deload_enabled, "
+                "current_weight, current_reps) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, name, name_lc, body.exercise_type, body.goal, body.rep_unit,
+                 body.rep_range_low, body.rep_range_high, body.frequency, body.sets_count,
+                 body.increment, body.start_weight, body.start_reps, body.start_rir,
+                 total_sessions, int(body.deload_enabled), body.start_weight, body.start_reps)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
+        new_id = cur.lastrowid
+
+        sessions = generate_remaining_sessions(
+            body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
+            body.increment, body.sets_count, total_sessions, 1, body.start_weight, body.start_reps
+        )
+        _insert_sessions(conn, new_id, sessions)
+        return {"ok": True, "id": new_id}
+
+
+@app.get("/progressions/{progression_id}")
+def get_progression(progression_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        sessions = conn.execute(
+            "SELECT * FROM progression_sessions WHERE progression_id=? ORDER BY session_index",
+            (progression_id,)
+        ).fetchall()
+    d = _serialize_progression(prog)
+    d["sessions"] = [_serialize_session(s) for s in sessions]
+    return d
+
+
+@app.put("/progressions/{progression_id}")
+def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        if prog["mode"] != "calculated" or prog["status"] != "active":
+            raise HTTPException(400, "Редактировать можно только активную расчётную прогрессию")
+
+        goal          = body.goal if body.goal is not None else prog["goal"]
+        low           = body.rep_range_low if body.rep_range_low is not None else prog["rep_range_low"]
+        high          = body.rep_range_high if body.rep_range_high is not None else prog["rep_range_high"]
+        frequency     = body.frequency if body.frequency is not None else prog["frequency"]
+        sets_count    = body.sets_count if body.sets_count is not None else prog["sets_count"]
+        increment     = body.increment if body.increment is not None else prog["increment"]
+        deload        = body.deload_enabled if body.deload_enabled is not None else bool(prog["deload_enabled"])
+        if high <= low:
+            raise HTTPException(400, "Верх диапазона повторов должен быть больше низа")
+
+        conn.execute(
+            "UPDATE progressions SET goal=?, rep_range_low=?, rep_range_high=?, frequency=?, sets_count=?, "
+            "increment=?, deload_enabled=?, updated_at=datetime('now') WHERE id=?",
+            (goal, low, high, frequency, sets_count, increment, int(deload), progression_id)
+        )
+
+        nxt = conn.execute(
+            "SELECT MIN(session_index) i FROM progression_sessions WHERE progression_id=? AND status='pending'",
+            (progression_id,)
+        ).fetchone()["i"]
+        if nxt is not None:
+            cw, cr = prog["current_weight"], prog["current_reps"]
+            # проецируем текущую точку в новый диапазон, если она за его пределами
+            if cr > high:
+                cw, cr = normalize_overflow(cw, cr, low, high, increment)
+            elif cr < low:
+                cr = low
+            conn.execute("UPDATE progressions SET current_weight=?, current_reps=? WHERE id=?", (cw, cr, progression_id))
+            conn.execute(
+                "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,)
+            )
+            sessions = generate_remaining_sessions(
+                prog["exercise_type"], frequency, low, high, increment, sets_count,
+                prog["total_sessions"], nxt, cw, cr
+            )
+            _insert_sessions(conn, progression_id, sessions)
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/archive")
+def archive_progression(progression_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        _get_owned_progression(conn, pid, progression_id)
+        conn.execute("UPDATE progressions SET status='archived', updated_at=datetime('now') WHERE id=?", (progression_id,))
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/sessions/{session_id}/log")
+def log_progression_session(progression_id: int, session_id: int, body: SessionLogIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        session = conn.execute(
+            "SELECT * FROM progression_sessions WHERE id=? AND progression_id=?", (session_id, progression_id)
+        ).fetchone()
+        if not session:
+            raise HTTPException(404, "Сессия не найдена")
+        if session["status"] != "pending":
+            raise HTTPException(400, "Эта сессия уже отыграна или пропущена")
+
+        conn.execute(
+            "UPDATE progression_sessions SET status='done', actual_weight=?, actual_reps=?, actual_sets=?, "
+            "actual_rir=?, workout_id=?, completed_at=datetime('now') WHERE id=?",
+            (body.actual_weight, body.actual_reps, body.actual_sets, body.actual_rir, body.workout_id, session_id)
+        )
+
+        if prog["mode"] == "calculated" and session["role"] in (None, "heavy"):
+            new_w, new_r, new_fail = adapt_actual(
+                session["planned_weight"], session["planned_reps"], session["planned_sets"],
+                body.actual_weight, body.actual_reps, body.actual_sets,
+                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
+            )
+            conn.execute(
+                "UPDATE progressions SET current_weight=?, current_reps=?, fail_streak=?, updated_at=datetime('now') WHERE id=?",
+                (new_w, new_r, new_fail, progression_id)
+            )
+            conn.execute(
+                "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
+                (progression_id, session["session_index"])
+            )
+            if session["session_index"] < prog["total_sessions"]:
+                sessions = generate_remaining_sessions(
+                    prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                    prog["increment"], prog["sets_count"], prog["total_sessions"],
+                    session["session_index"] + 1, new_w, new_r
+                )
+                _insert_sessions(conn, progression_id, sessions)
+
+        _maybe_complete(conn, progression_id)
+
+        updated = _get_owned_progression(conn, pid, progression_id)
+        sessions_rows = conn.execute(
+            "SELECT * FROM progression_sessions WHERE progression_id=? ORDER BY session_index", (progression_id,)
+        ).fetchall()
+    d = _serialize_progression(updated)
+    d["sessions"] = [_serialize_session(s) for s in sessions_rows]
+    return d
+
+
+@app.post("/progressions/{progression_id}/sessions/{session_id}/skip")
+def skip_progression_session(progression_id: int, session_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        _get_owned_progression(conn, pid, progression_id)
+        session = conn.execute(
+            "SELECT * FROM progression_sessions WHERE id=? AND progression_id=?", (session_id, progression_id)
+        ).fetchone()
+        if not session or session["status"] != "pending":
+            raise HTTPException(400, "Сессию нельзя пропустить")
+        conn.execute("UPDATE progression_sessions SET status='skipped' WHERE id=?", (session_id,))
+        _maybe_complete(conn, progression_id)
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/undo-last")
+def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        sessions = conn.execute(
+            "SELECT * FROM progression_sessions WHERE progression_id=? ORDER BY session_index", (progression_id,)
+        ).fetchall()
+        done = [s for s in sessions if s["status"] == "done"]
+        if not done:
+            raise HTTPException(400, "Нечего отменять — ни одной отыгранной сессии")
+        target = max(done, key=lambda s: s["session_index"])
+
+        conn.execute(
+            "UPDATE progression_sessions SET status='pending', actual_weight=NULL, actual_reps=NULL, "
+            "actual_sets=NULL, actual_rir=NULL, workout_id=NULL, completed_at=NULL WHERE id=?", (target["id"],)
+        )
+
+        if prog["mode"] == "calculated" and target["role"] in (None, "heavy"):
+            # переигрываем историю до target, чтобы честно восстановить current_weight/current_reps
+            w, r, fail = prog["start_weight"], prog["start_reps"], 0
+            for s in sessions:
+                if s["session_index"] >= target["session_index"]:
+                    break
+                if s["status"] == "done" and s["role"] in (None, "heavy"):
+                    w, r, fail = adapt_actual(
+                        s["planned_weight"], s["planned_reps"], s["planned_sets"],
+                        s["actual_weight"], s["actual_reps"], s["actual_sets"],
+                        prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
+                    )
+            conn.execute(
+                "UPDATE progressions SET current_weight=?, current_reps=?, fail_streak=?, status='active', "
+                "updated_at=datetime('now') WHERE id=?",
+                (w, r, fail, progression_id)
+            )
+            conn.execute(
+                "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
+                (progression_id, target["session_index"])
+            )
+            new_sessions = generate_remaining_sessions(
+                prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                prog["increment"], prog["sets_count"], prog["total_sessions"], target["session_index"], w, r
+            )
+            _insert_sessions(conn, progression_id, new_sessions)
+        else:
+            conn.execute("UPDATE progressions SET status='active' WHERE id=? AND status='completed'", (progression_id,))
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/new-cycle")
+def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        if prog["mode"] != "calculated" or prog["status"] != "completed":
+            raise HTTPException(400, "Новый цикл можно начать только для завершённой расчётной прогрессии")
+
+        goal        = body.goal or prog["goal"]
+        low         = body.rep_range_low if body.rep_range_low is not None else prog["rep_range_low"]
+        high        = body.rep_range_high if body.rep_range_high is not None else prog["rep_range_high"]
+        frequency   = body.frequency if body.frequency is not None else prog["frequency"]
+        sets_count  = body.sets_count if body.sets_count is not None else prog["sets_count"]
+        increment   = body.increment if body.increment is not None else prog["increment"]
+        deload      = body.deload_enabled if body.deload_enabled is not None else bool(prog["deload_enabled"])
+        weeks       = body.weeks if body.weeks is not None else max(1, (prog["total_sessions"] or frequency) // (prog["frequency"] or 1))
+        total_sessions = weeks * frequency
+        start_w, start_r = prog["current_weight"], prog["current_reps"]
+
+        try:
+            cur = conn.execute(
+                "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
+                "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
+                "increment, start_weight, start_reps, total_sessions, deload_enabled, current_weight, current_reps) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
+                 low, high, frequency, sets_count, increment, start_w, start_r, total_sessions, int(deload),
+                 start_w, start_r)
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
+        new_id = cur.lastrowid
+        sessions = generate_remaining_sessions(
+            prog["exercise_type"], frequency, low, high, increment, sets_count, total_sessions, 1, start_w, start_r
+        )
+        _insert_sessions(conn, new_id, sessions)
+    return {"ok": True, "id": new_id}
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "service": "gym-diary-api"}
@@ -922,6 +1577,7 @@ def admin_page(title: str, body: str) -> HTMLResponse:
     nav = (
         '<div class="nav">'
         '<a href="/admin">Дашборд</a>'
+        '<a href="/admin/premium">Премиум</a>'
         '<a href="/admin/sql">SQL-запрос</a>'
         '<a href="/admin/db/download">Скачать базу</a>'
         '<a href="/admin/db/upload">Загрузить базу</a>'
@@ -962,6 +1618,66 @@ def admin_dashboard(_: bool = Depends(verify_admin)):
                 f" — {count} записей</div>"
             )
     return admin_page("Админка · gym-diary", f"<h2>Таблицы</h2>{cards}")
+
+
+@app.get("/admin/premium", response_class=HTMLResponse, include_in_schema=False)
+def admin_premium_page(_: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        users = conn.execute(
+            "SELECT user_id, username, first_name, is_premium FROM users ORDER BY first_name, username"
+        ).fetchall()
+
+    rows_html = ""
+    for u in users:
+        label = html.escape(u["first_name"] or u["username"] or u["user_id"])
+        uname = f" (@{html.escape(u['username'])})" if u["username"] else ""
+        checked = "checked" if u["is_premium"] else ""
+        rows_html += (
+            f'<label style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1A1A1A;'
+            f'text-transform:none;font-size:14px;color:#FFF">'
+            f'<input type="checkbox" name="premium" value="{html.escape(u["user_id"])}" {checked} '
+            f'style="width:auto;margin:0">{label}{uname}'
+            f"</label>"
+        )
+
+    body = (
+        '<div class="card">'
+        '<form method="post" action="/admin/premium/bulk" style="display:flex;gap:8px">'
+        '<button class="btn" name="action" value="enable_all" type="submit">Включить всем</button>'
+        '<button class="btn ghost" name="action" value="disable_all" type="submit">Выключить всем</button>'
+        "</form></div>"
+        '<form method="post" action="/admin/premium">'
+        f"{rows_html}"
+        '<div style="height:14px"></div>'
+        '<button class="btn" type="submit">Сохранить</button></form>'
+    )
+    return admin_page("Премиум-пользователи", body)
+
+
+@app.post("/admin/premium", response_class=HTMLResponse, include_in_schema=False)
+async def admin_premium_save(request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    checked_ids = set(form.getlist("premium"))
+    with get_db() as conn:
+        all_ids = [r["user_id"] for r in conn.execute("SELECT user_id FROM users").fetchall()]
+        for uid in all_ids:
+            conn.execute(
+                "UPDATE users SET is_premium=? WHERE user_id=?",
+                (1 if uid in checked_ids else 0, uid)
+            )
+    return RedirectResponse("/admin/premium", status_code=303)
+
+
+@app.post("/admin/premium/bulk", response_class=HTMLResponse, include_in_schema=False)
+async def admin_premium_bulk(request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    action = form.get("action")
+    with get_db() as conn:
+        if action == "enable_all":
+            conn.execute("UPDATE users SET is_premium=1")
+        elif action == "disable_all":
+            conn.execute("UPDATE users SET is_premium=0")
+    return RedirectResponse("/admin/premium", status_code=303)
 
 
 @app.get("/admin/table/{table}", response_class=HTMLResponse, include_in_schema=False)

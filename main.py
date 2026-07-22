@@ -192,6 +192,8 @@ def init_db():
                 actual_sets     INTEGER,
                 actual_rir      REAL,
                 completed_at    TEXT,
+                planned_detail  TEXT,
+                actual_detail   TEXT,
 
                 UNIQUE(progression_id, session_index)
             );
@@ -209,6 +211,11 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "is_premium" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(progression_sessions)").fetchall()]
+        if "planned_detail" not in cols:
+            conn.execute("ALTER TABLE progression_sessions ADD COLUMN planned_detail TEXT")
+        if "actual_detail" not in cols:
+            conn.execute("ALTER TABLE progression_sessions ADD COLUMN actual_detail TEXT")
 
         migrate_legacy_data(conn)
 
@@ -413,10 +420,12 @@ class ExerciseNoteRenameIn(BaseModel):
     old_name: str
     new_name: str
 
-class ManualSessionIn(BaseModel):
+class ManualSetIn(BaseModel):
     weight: float
     reps: int
-    sets: int
+
+class ManualSessionIn(BaseModel):
+    sets: list[ManualSetIn]   # каждый подход — свой вес/повторы, без общего "на всю тренировку"
 
 class ProgressionCreateIn(BaseModel):
     exercise_name:  str
@@ -453,6 +462,7 @@ class SessionLogIn(BaseModel):
     actual_sets:   int
     actual_rir:    Optional[float] = None
     workout_id:    Optional[int] = None
+    actual_detail: Optional[list[ManualSetIn]] = None   # подробный факт по каждому подходу (произвольный режим)
 
 class NewCycleIn(BaseModel):
     weeks:          Optional[int] = None
@@ -764,12 +774,27 @@ def _fmt_progression_role(role):
     return {"heavy": "Тяжёлая", "light": "Лёгкая", "medium": "Средняя", "volume": "Объёмная"}.get(role, "")
 
 
-def _fmt_progression_session_line(s: dict, rep_unit: str) -> str:
+def _fmt_progression_session_line(s, rep_unit: str) -> str:
+    s = dict(s)  # s может быть как sqlite3.Row (экспорт), так и обычным dict — Row не умеет .get()
     unit = "сек" if rep_unit == "seconds" else "повт"
     role = f" ({_fmt_progression_role(s['role'])})" if s.get("role") else ""
-    plan = f"План: {s['planned_weight']} кг × {s['planned_reps']} {unit} × {s['planned_sets']} подх{role}"
+
+    planned_detail = s.get("planned_detail")
+    if isinstance(planned_detail, str):
+        planned_detail = json.loads(planned_detail)
+    if planned_detail:
+        plan = "План: " + "; ".join(f"{d['weight']} кг × {d['reps']} {unit}" for d in planned_detail)
+    else:
+        plan = f"План: {s['planned_weight']} кг × {s['planned_reps']} {unit} × {s['planned_sets']} подх{role}"
+
     if s["status"] == "done":
-        fact = f"Факт: {s['actual_weight']} кг × {s['actual_reps']} {unit} × {s['actual_sets']} подх"
+        actual_detail = s.get("actual_detail")
+        if isinstance(actual_detail, str):
+            actual_detail = json.loads(actual_detail)
+        if actual_detail:
+            fact = "Факт: " + "; ".join(f"{d['weight']} кг × {d['reps']} {unit}" for d in actual_detail)
+        else:
+            fact = f"Факт: {s['actual_weight']} кг × {s['actual_reps']} {unit} × {s['actual_sets']} подх"
         return f"{plan}  →  {fact}"
     if s["status"] == "skipped":
         return f"{plan}  →  пропущена"
@@ -1143,7 +1168,12 @@ def _serialize_progression(row) -> dict:
 
 
 def _serialize_session(row) -> dict:
-    return dict(row)
+    d = dict(row)
+    if d.get("planned_detail"):
+        d["planned_detail"] = json.loads(d["planned_detail"])
+    if d.get("actual_detail"):
+        d["actual_detail"] = json.loads(d["actual_detail"])
+    return d
 
 
 def _maybe_complete(conn, progression_id: int):
@@ -1162,6 +1192,19 @@ def _insert_sessions(conn, progression_id: int, sessions):
         "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets) "
         "VALUES (?,?,?,?,?,?)",
         [(progression_id, idx, role, w, r, s) for idx, role, w, r, s in sessions]
+    )
+
+
+def _insert_manual_sessions(conn, progression_id: int, manual_sessions: list):
+    """Каждая сессия — список подходов {weight,reps}, свой на каждый подход (не общий на тренировку)."""
+    rows = []
+    for idx, sess in enumerate(manual_sessions, 1):
+        detail = [{"weight": s.weight, "reps": s.reps} for s in sess.sets]
+        rows.append((progression_id, idx, detail[0]["weight"], detail[0]["reps"], len(detail),
+                     json.dumps(detail, ensure_ascii=False)))
+    conn.executemany(
+        "INSERT INTO progression_sessions (progression_id, session_index, planned_weight, planned_reps, planned_sets, planned_detail) "
+        "VALUES (?,?,?,?,?,?)", rows
     )
 
 
@@ -1215,6 +1258,9 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
         if body.mode == "manual":
             if not body.manual_sessions:
                 raise HTTPException(400, "Нужна хотя бы одна сессия плана")
+            for i, sess in enumerate(body.manual_sessions, 1):
+                if not sess.sets:
+                    raise HTTPException(400, f"Тренировка {i}: нужен хотя бы один подход")
             total_sessions = len(body.manual_sessions)
             try:
                 cur = conn.execute(
@@ -1225,8 +1271,7 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             except sqlite3.IntegrityError:
                 raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
             new_id = cur.lastrowid
-            sessions = [(i, None, s.weight, s.reps, s.sets) for i, s in enumerate(body.manual_sessions, 1)]
-            _insert_sessions(conn, new_id, sessions)
+            _insert_manual_sessions(conn, new_id, body.manual_sessions)
             return {"ok": True, "id": new_id}
 
         # calculated
@@ -1360,8 +1405,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
 
         conn.execute(
             "UPDATE progression_sessions SET status='done', actual_weight=?, actual_reps=?, actual_sets=?, "
-            "actual_rir=?, workout_id=?, completed_at=datetime('now') WHERE id=?",
-            (body.actual_weight, body.actual_reps, body.actual_sets, body.actual_rir, body.workout_id, session_id)
+            "actual_rir=?, workout_id=?, actual_detail=?, completed_at=datetime('now') WHERE id=?",
+            (body.actual_weight, body.actual_reps, body.actual_sets, body.actual_rir, body.workout_id,
+             json.dumps([{"weight": s.weight, "reps": s.reps} for s in body.actual_detail], ensure_ascii=False) if body.actual_detail else None,
+             session_id)
         )
 
         if prog["mode"] == "calculated" and session["role"] in (None, "heavy"):

@@ -28,6 +28,18 @@ app.add_middleware(
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH   = os.environ.get("DB_PATH", "gym.db")
 
+# ── Бот больше не отдельный сервис на long polling — см. секцию "Telegram-бот
+# (вебхук)" ниже. WEBAPP_URL — та же ссылка на GitHub Pages, что раньше была
+# у отдельного bot.py. TELEGRAM_WEBHOOK_SECRET — случайная строка в пути
+# вебхука, чтобы никто посторонний не мог слать сюда фейковые "обновления".
+# PUBLIC_URL — публичный домен ЭТОГО бэкенда на Railway (тот же, что
+# VITE_API_URL у фронтенда) — если задан, при старте сам регистрирует вебхук
+# у Telegram; если не задан — вебхук нужно один раз включить вручную (см.
+# инструкцию по деплою).
+WEBAPP_URL              = os.environ.get("WEBAPP_URL", "")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+PUBLIC_URL              = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
 
 # ── База данных ───────────────────────────────────────────────────────────────
 
@@ -930,6 +942,85 @@ def _send_telegram_document(chat_id: str, filename: str, content: bytes, caption
         result = json.loads(resp.read().decode("utf-8"))
     if not result.get("ok"):
         raise RuntimeError(result.get("description", "Неизвестная ошибка Telegram API"))
+
+
+# ── Telegram-бот (вебхук) ────────────────────────────────────────────────────
+# Раньше отдельный сервис bot.py на long polling: он сам, постоянно, каждые
+# несколько секунд стучался к серверам Telegram ("есть что-то новое?"). Для
+# Railway это непрерывный ИСХОДЯЩИЙ трафик, а "уход в сон" у Railway считается
+# именно по отсутствию исходящего трафика — поэтому такой сервис никогда не
+# засыпал, даже когда ботом реально никто не пользовался, и жёг деньги просто
+# так. Вебхук устроен наоборот: Telegram сам присылает HTTP-запрос СЮДА, когда
+# есть новое сообщение — между сообщениями никакого трафика нет вообще, и этот
+# бэкенд спит между запросами так же, как и всегда (весь остальной код тут
+# уже был к этому готов — своих исходящих фоновых соединений у него и не было).
+# Вся логика — ровно то, что раньше делал bot.py: ответ на /start (и на
+# /start с payload приглашения) с кнопкой открытия Mini App.
+
+def _send_telegram_message(chat_id, text: str, reply_markup: dict = None) -> None:
+    if not BOT_TOKEN:
+        return
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception:
+        pass  # ответ боту — не критичная операция, не должна ронять обработку вебхука
+
+
+@app.post("/telegram/webhook/{secret}", include_in_schema=False)
+async def telegram_webhook(secret: str, request: Request):
+    # Секрет прямо в пути — простая защита от посторонних POST-запросов на
+    # этот адрес (Telegram всегда шлёт его же, раз он задан при setWebhook).
+    if not TELEGRAM_WEBHOOK_SECRET or secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(404, "Not found")
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    chat_id = (message.get("chat") or {}).get("id")
+    if chat_id and text.startswith("/start"):
+        parts = text.split(maxsplit=1)
+        webapp_url = WEBAPP_URL
+        reply_text = "Привет! Нажми кнопку чтобы открыть дневник тренировок 👇"
+        if len(parts) > 1:
+            invite_payload = parts[1].strip()
+            sep = "&" if "?" in webapp_url else "?"
+            webapp_url = f"{webapp_url}{sep}invite={invite_payload}"
+            reply_text = "Тебя пригласили в дневник тренировок! Нажми кнопку — и вы автоматически станете друзьями 👇"
+        reply_markup = {"inline_keyboard": [[{"text": "💪 Открыть дневник", "web_app": {"url": webapp_url}}]]}
+        _send_telegram_message(chat_id, reply_text, reply_markup)
+
+    # Telegram ждёт быстрый 200 OK на любое обновление, иначе будет повторять
+    # доставку — отвечаем ok даже на сообщения, которые не /start.
+    return {"ok": True}
+
+
+@app.on_event("startup")
+def _register_telegram_webhook():
+    if not (BOT_TOKEN and PUBLIC_URL and TELEGRAM_WEBHOOK_SECRET):
+        return  # не всё настроено — тихо пропускаем, вебхук можно включить и вручную (см. деплой)
+    url = f"{PUBLIC_URL}/telegram/webhook/{TELEGRAM_WEBHOOK_SECRET}"
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={urllib.parse.quote(url, safe='')}",
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except Exception:
+        pass  # не мешаем запуску бэкенда, если Telegram недоступен в момент старта
 
 
 def _profile_export_data(profile_id: int, uid: str):

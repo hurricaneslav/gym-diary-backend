@@ -873,8 +873,11 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
                 unit = "кг" if key == "weight" else "см"
                 lines.append(f"  {label}: {val} {unit}")
                 filled = True
-        if not filled:
+        comment = (data.get("comment") or "").strip()
+        if not filled and not comment:
             lines.append("  (ничего не заполнено)")
+        if comment:
+            lines.append(f"  Комментарий: {comment}")
         lines.append("")
 
     # Упражнения — список + описание техники + ПОЛНАЯ история по каждому (как в

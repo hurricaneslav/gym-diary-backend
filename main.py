@@ -125,6 +125,13 @@ def init_db():
                 date    TEXT NOT NULL,
                 data    TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS templates (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                profile_id INTEGER NOT NULL,
+                name       TEXT NOT NULL,
+                exercises  TEXT NOT NULL DEFAULT '[]'
+            );
             CREATE TABLE IF NOT EXISTS profiles (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
                 owner_id       TEXT NOT NULL,
@@ -407,6 +414,11 @@ class MeasurementIn(BaseModel):
     date: str
     data: dict = {}
 
+class TemplateIn(BaseModel):
+    id:        int
+    name:      str
+    exercises: list   # [{name: str, sets_count: int}, ...]
+
 class ProfileCreateIn(BaseModel):
     name: str
 
@@ -532,6 +544,54 @@ def delete_workout(workout_id: int, x_init_data: str = Header(...)):
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
         conn.execute("DELETE FROM workouts WHERE profile_id=? AND id=?", (pid, workout_id))
+    return {"ok": True}
+
+
+# ── Роуты: шаблоны тренировок ─────────────────────────────────────────────────
+
+@app.get("/templates")
+def list_templates(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        rows = conn.execute(
+            "SELECT * FROM templates WHERE profile_id=? ORDER BY id DESC", (pid,)
+        ).fetchall()
+    return [{"id":r["id"],"name":r["name"],"exercises":json.loads(r["exercises"])} for r in rows]
+
+
+@app.post("/templates")
+def save_template(t: TemplateIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        if t.id != -1:
+            existing = conn.execute(
+                "SELECT id FROM templates WHERE profile_id=? AND id=?", (pid, t.id)
+            ).fetchone()
+        else:
+            existing = None
+
+        if existing:
+            conn.execute(
+                "UPDATE templates SET name=?, exercises=? WHERE profile_id=? AND id=?",
+                (t.name, json.dumps(t.exercises, ensure_ascii=False), pid, t.id)
+            )
+            return {"ok": True, "id": t.id}
+        else:
+            cur = conn.execute(
+                "INSERT INTO templates (user_id, profile_id, name, exercises) VALUES (?,?,?,?)",
+                (uid, pid, t.name, json.dumps(t.exercises, ensure_ascii=False))
+            )
+            return {"ok": True, "id": cur.lastrowid}
+
+
+@app.delete("/templates/{template_id}")
+def delete_template(template_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        conn.execute("DELETE FROM templates WHERE profile_id=? AND id=?", (pid, template_id))
     return {"ok": True}
 
 
@@ -729,6 +789,7 @@ def delete_profile(profile_id: int, x_init_data: str = Header(...)):
 
         conn.execute("DELETE FROM workouts WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM measurements WHERE profile_id=?", (profile_id,))
+        conn.execute("DELETE FROM templates WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid))
 
         active = conn.execute("SELECT active_profile_id FROM users WHERE user_id=?", (uid,)).fetchone()

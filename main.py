@@ -187,6 +187,8 @@ def init_db():
 
                 current_weight   REAL,
                 current_reps     INTEGER,
+                current_reps_detail TEXT,
+                unilateral       INTEGER NOT NULL DEFAULT 0,
                 fail_streak      INTEGER NOT NULL DEFAULT 0,
 
                 created_at       TEXT NOT NULL DEFAULT (datetime('now')),
@@ -218,6 +220,11 @@ def init_db():
             );
         """)
         # Миграция: добавляем profile_id в старые таблицы, если его ещё нет
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(progressions)").fetchall()]
+        if "current_reps_detail" not in cols:
+            conn.execute("ALTER TABLE progressions ADD COLUMN current_reps_detail TEXT")
+        if "unilateral" not in cols:
+            conn.execute("ALTER TABLE progressions ADD COLUMN unilateral INTEGER NOT NULL DEFAULT 0")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(workouts)").fetchall()]
         if "profile_id" not in cols:
             conn.execute("ALTER TABLE workouts ADD COLUMN profile_id INTEGER")
@@ -306,15 +313,21 @@ def normalize_pair(a: str, b: str):
 # Никакого состояния и никаких обращений к БД — только математика. Специально
 # отделены от роутов, чтобы их можно было прогнать на фейковых данных без
 # поднятия сервера (см. tests в конце файла / отдельный тест-скрипт).
+#
+# Состояние прогрессии — не одно число повторов, а список повторов по каждому
+# рабочему подходу (reps_detail), одной длины с sets_count. Вес один на всю
+# сессию (кроме лёгкого дня — см. ниже, там тоже один вес, просто ниже цель
+# по повторам). Причина: разные подходы "не сгорают" одинаково — если 3-й
+# подход не дотянул, это не должно портить прогресс по 1-му и 2-му.
 
-VARYING_TYPES = ("main_compound", "accessory_compound")  # у этих типов есть роли heavy/light/medium/volume
+VARYING_TYPES = ("main_compound", "accessory_compound")  # у этих типов есть роли heavy/light
 ROLE_TEMPLATES = {
     1: ["heavy"],
     2: ["heavy", "light"],
-    3: ["heavy", "light", "medium"],
-    4: ["heavy", "medium", "light", "volume"],
+    3: ["heavy", "light", "heavy"],
+    4: ["heavy", "light", "heavy", "light"],
 }
-ROLE_WEIGHT_PCT = {"light": 0.10, "medium": 0.05, "volume": 0.12}  # снижение веса от heavy-цели недели
+LIGHT_REPS_PCT = 0.55  # лёгкий день: тот же вес, повторы — доля от цели тяжёлого дня (~RIR 3-4)
 
 
 def round_to_increment(weight: float, increment: float) -> float:
@@ -323,81 +336,137 @@ def round_to_increment(weight: float, increment: float) -> float:
     return round(round(weight / increment) * increment, 3)
 
 
-def climb(weight: float, reps: int, low: int, high: int, increment: float):
-    """Шаг двойной прогрессии: набираем повторы на одном весе, затем вес вверх и повторы к низу диапазона."""
-    if reps < high:
-        return weight, reps + 1
-    return round_to_increment(weight + increment, increment), low
-
-
-def normalize_overflow(weight: float, reps: int, low: int, high: int, increment: float):
-    """Если факт превысил верх диапазона повторов — "перевыполнение" превращается в шаги веса."""
-    span = high - low + 1
-    while reps > high:
-        reps -= span
-        weight = round_to_increment(weight + increment, increment)
-    if reps < low:
-        reps = low
-    return weight, reps
-
-
 def role_template(exercise_type: str, frequency: int):
     if exercise_type in VARYING_TYPES:
         return ROLE_TEMPLATES.get(max(1, min(frequency or 1, 4)), ROLE_TEMPLATES[1])
-    return [None]  # изоляция/изометрия/произвольное — без вариации по дням, каждая сессия "как heavy"
+    return [None]  # изоляция/произвольное — без вариации по дням, каждая сессия "как heavy"
 
 
-def role_adjust(role: str, anchor_weight: float, anchor_reps: int, sets_count: int, increment: float):
-    """Вес/подходы для light/medium/volume-сессии недели, от heavy-цели этой же недели (anchor)."""
-    pct = ROLE_WEIGHT_PCT.get(role, 0.0)
-    w = round_to_increment(anchor_weight * (1 - pct), increment)
-    sets = sets_count + 1 if role == "volume" else sets_count
-    return w, anchor_reps, sets
+def role_adjust_detail(role: str, anchor_weight: float, anchor_reps_detail: list):
+    """Вес/повторы по подходам для light-сессии недели, от heavy-цели этой же недели (anchor)."""
+    if role != "light":
+        return anchor_weight, list(anchor_reps_detail)
+    light_reps = [max(1, round(r * LIGHT_REPS_PCT)) for r in anchor_reps_detail]
+    return anchor_weight, light_reps
+
+
+def climb_detail(weight: float, reps_detail: list, low: int, high: int, increment: float):
+    """Шаг двойной прогрессии на границе недели (используется для ОПТИМИСТИЧНОГО предпоказа
+    цели до того, как сессия реально отыграна — реальный факт потом переопределит анкор
+    через adapt_actual_detail)."""
+    if all(r >= high for r in reps_detail):
+        return round_to_increment(weight + increment, increment), [low] * len(reps_detail)
+    return weight, [min(high, r + 1) for r in reps_detail]
+
+
+def normalize_range_detail(weight: float, reps_detail: list, low: int, high: int, increment: float):
+    """Проекция текущей точки в новый диапазон повторов при ручном редактировании параметров
+    прогрессии — просто зажимаем каждый подход в новые границы, без пересчёта веса."""
+    return weight, [min(high, max(low, int(r))) for r in reps_detail]
 
 
 def generate_remaining_sessions(exercise_type, frequency, low, high, increment, sets_count,
-                                 total_sessions, from_index, anchor_weight, anchor_reps):
+                                 total_sessions, from_index, anchor_weight, anchor_reps_detail):
     """
     Строит план сессий от from_index (включительно) до total_sessions, начиная с состояния
-    (anchor_weight, anchor_reps) — это цель ближайшей heavy/"стандартной" сессии. Роль каждого
-    индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне (не сдвигается при перегенерации),
-    поэтому пересчёт с середины недели не путает фазу light/medium/volume.
-    Возвращает список кортежей (session_index, role, planned_weight, planned_reps, planned_sets).
+    (anchor_weight, anchor_reps_detail) — цель ближайшей heavy/"стандартной" сессии, по подходам.
+    Роль каждого индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне (не сдвигается при
+    перегенерации), поэтому пересчёт с середины недели не путает фазу heavy/light.
+    Возвращает список кортежей (session_index, role, planned_weight, planned_reps_detail, planned_sets).
     """
     template = role_template(exercise_type, frequency)
     freq = len(template)
-    w, r = anchor_weight, anchor_reps
+    w, reps_detail = anchor_weight, list(anchor_reps_detail)
     out = []
     for idx in range(from_index, total_sessions + 1):
         phase = (idx - 1) % freq
         if idx > from_index and phase == 0:
-            w, r = climb(w, r, low, high, increment)
+            w, reps_detail = climb_detail(w, reps_detail, low, high, increment)
         role = template[phase]
         if role in (None, "heavy"):
-            out.append((idx, role, w, r, sets_count))
+            out.append((idx, role, w, list(reps_detail), sets_count))
         else:
-            aw, ar, asets = role_adjust(role, w, r, sets_count, increment)
-            out.append((idx, role, aw, ar, asets))
+            aw, adetail = role_adjust_detail(role, w, reps_detail)
+            out.append((idx, role, aw, adetail, sets_count))
     return out
 
 
-def adapt_actual(planned_weight, planned_reps, planned_sets, actual_weight, actual_reps, actual_sets,
-                  low, high, increment, prior_fail_streak: int):
+def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list,
+                         low, high, increment, prior_fail_streak: int):
     """
-    По факту одной heavy/"стандартной" сессии решает новую точку (anchor_weight, anchor_reps),
-    от которой будут перегенерированы все дальнейшие сессии, и новый fail_streak.
+    По факту одной heavy/"стандартной" сессии (по каждому подходу отдельно) решает новую
+    точку (anchor_weight, anchor_reps_detail), от которой будут перегенерированы все
+    дальнейшие сессии, и новый fail_streak.
+
+    Step UP:   все рабочие подходы достигли верха диапазона → вес +increment, повторы к низу.
+    Hold:      хотя бы один подход не дотянул до верха, но 1-й подход ≥ низа диапазона →
+               вес тот же, следующая цель по каждому подходу +1 повтор (успешные подходы,
+               уже на верху диапазона, остаются на нём).
+    Step DOWN: 1-й подход не набрал низ диапазона ДВАЖДЫ подряд на одном весе → -10%.
     """
-    if actual_sets is not None and planned_sets and actual_sets < planned_sets:
-        # не выполнил весь плановый объём — не даём сработать "опережающей" ветке
-        return actual_weight, actual_reps, 0
-    if actual_reps < low and actual_weight == planned_weight:
+    n = len(planned_reps_detail)
+    if len(actual_detail) < n:
+        # неполный объём — не оцениваем UP/DOWN, просто переносим факт по сделанным подходам,
+        # план для недостающих подходов не трогаем; fail_streak сбрасываем (как и раньше)
+        new_reps = list(planned_reps_detail)
+        for i, s in enumerate(actual_detail):
+            new_reps[i] = int(s["reps"])
+        actual_weight = actual_detail[0]["weight"] if actual_detail else planned_weight
+        return actual_weight, new_reps, 0
+
+    actual_weight = actual_detail[0]["weight"]
+    actual_reps = [int(s["reps"]) for s in actual_detail[:n]]
+
+    if actual_reps[0] < low and actual_weight == planned_weight:
         if prior_fail_streak >= 1:
-            # второй провал подряд на этом весе — автоделоад
-            return round_to_increment(actual_weight * 0.9, increment), low, 0
-        # первый провал — повторяем ту же цель ещё раз, без изменений
-        return planned_weight, planned_reps, prior_fail_streak + 1
-    w, r = normalize_overflow(actual_weight, actual_reps, low, high, increment)
-    return w, r, 0
+            return round_to_increment(actual_weight * 0.9, increment), [low] * n, 0
+        return planned_weight, planned_reps_detail, prior_fail_streak + 1
+
+    if all(r >= high for r in actual_reps):
+        return round_to_increment(actual_weight + increment, increment), [low] * n, 0
+
+    new_reps = [high if r >= high else max(1, r + 1) for r in actual_reps]
+    return actual_weight, new_reps, 0
+
+
+# ── Унилатеральный режим: тонкий адаптер поверх того же движка ──────────────
+# Идея: раздельный подход по сторонам — это ровно тот же adapt_actual_detail/
+# climb_detail/generate_remaining_sessions, только на "плоском" списке повторов
+# вдвое длиннее (sets_count*2), где в каждой паре слабая сторона идёт первой.
+# Ядро выше не меняется и не знает про стороны вообще — риск сломать уже
+# протестированный билатеральный путь нулевой. "L"/"R" на экране — это "более
+# слабая/сильная сторона В ЭТОМ подходе на момент генерации плана", а не
+# анатомически закреплённая рука/нога: если стороны на одной сессии поменялись
+# местами по факту, на следующей сессии они просто пересортируются заново.
+
+def _pack_unilateral_detail(weight: float, reps_flat: list) -> list:
+    """Плоский список длиной 2*n -> список подходов {weightL,repsL,weightR,repsR} для
+    planned_detail/отображения (repsL — слабая сторона пары, repsR — сильная)."""
+    return [
+        {"weightL": weight, "repsL": reps_flat[2 * i], "weightR": weight, "repsR": reps_flat[2 * i + 1], "bilateral": True}
+        for i in range(len(reps_flat) // 2)
+    ]
+
+
+def _unpack_unilateral_actual(actual_detail: list):
+    """Список фактических подходов -> (вес, плоский список {"weight","reps"} длиной 2*к-во
+    подходов, слабая сторона пары первой). Понимает и {weightL,repsL,weightR,repsR}, и обычный
+    {weight,reps} — второй вариант (сет по факту залогирован как билатеральный) трактуется как
+    "обе стороны сделали одинаково" — это и есть fallback смешанного режима."""
+    flat, weight = [], None
+    for s in actual_detail:
+        if s.get("repsL") is not None:
+            wl = s.get("weightL")
+            rl, rr = int(s["repsL"]), int(s.get("repsR") if s.get("repsR") is not None else s["repsL"])
+        else:
+            wl = s.get("weight")
+            rl = rr = int(s.get("reps") or 0)
+        if weight is None:
+            weight = wl
+        lo, hi = (rl, rr) if rl <= rr else (rr, rl)
+        flat.append({"weight": wl, "reps": lo})
+        flat.append({"weight": wl, "reps": hi})
+    return weight, flat
 
 
 # ── Модели ────────────────────────────────────────────────────────────────────
@@ -417,7 +486,7 @@ class MeasurementIn(BaseModel):
 class TemplateIn(BaseModel):
     id:        int
     name:      str
-    exercises: list   # [{name: str, sets_count: int}, ...]
+    exercises: list   # [{name: str, sets_count: int, bilateral: bool}, ...]
 
 class ProfileCreateIn(BaseModel):
     name: str
@@ -445,8 +514,12 @@ class ExerciseNoteRenameIn(BaseModel):
     new_name: str
 
 class ManualSetIn(BaseModel):
-    weight: float
-    reps: int
+    weight:  Optional[float] = None
+    reps:    Optional[int] = None
+    weightL: Optional[float] = None
+    repsL:   Optional[int] = None
+    weightR: Optional[float] = None
+    repsR:   Optional[int] = None
 
 class ManualSessionIn(BaseModel):
     sets: list[ManualSetIn]   # каждый подход — свой вес/повторы, без общего "на всю тренировку"
@@ -455,9 +528,9 @@ class ProgressionCreateIn(BaseModel):
     exercise_name:  str
     mode:           str                       # 'manual' | 'calculated'
     # calculated:
-    exercise_type:  Optional[str] = None       # main_compound|accessory_compound|isolation|isometric|custom
+    exercise_type:  Optional[str] = None       # main_compound|accessory_compound|isolation|custom
     goal:           Optional[str] = None       # strength|hypertrophy|strength_hypertrophy
-    rep_unit:       str = "reps"               # reps|seconds
+    rep_unit:       str = "reps"               # оставлено для обратной совместимости, всегда "reps"
     rep_range_low:  Optional[int] = None
     rep_range_high: Optional[int] = None
     frequency:      Optional[int] = None
@@ -468,6 +541,7 @@ class ProgressionCreateIn(BaseModel):
     start_rir:      Optional[float] = None
     weeks:          Optional[int] = None       # длительность цикла в неделях (total_sessions = weeks*frequency)
     deload_enabled: bool = False
+    unilateral:     bool = False               # раздельный учёт по сторонам (см. _pack_unilateral_detail)
     # manual:
     manual_sessions: list[ManualSessionIn] = []
 
@@ -844,19 +918,19 @@ def _fmt_set_line(s: dict):
 
 
 def _fmt_progression_role(role):
-    return {"heavy": "Тяжёлая", "light": "Лёгкая", "medium": "Средняя", "volume": "Объёмная"}.get(role, "")
+    return {"heavy": "Тяжёлая", "light": "Лёгкая"}.get(role, "")
 
 
 def _fmt_progression_session_line(s, rep_unit: str) -> str:
     s = dict(s)  # s может быть как sqlite3.Row (экспорт), так и обычным dict — Row не умеет .get()
-    unit = "сек" if rep_unit == "seconds" else "повт"
+    unit = "повт"
     role = f" ({_fmt_progression_role(s['role'])})" if s.get("role") else ""
 
     planned_detail = s.get("planned_detail")
     if isinstance(planned_detail, str):
         planned_detail = json.loads(planned_detail)
     if planned_detail:
-        plan = "План: " + "; ".join(f"{d['weight']} кг × {d['reps']} {unit}" for d in planned_detail)
+        plan = "План: " + "; ".join(_fmt_set_line(d) or "—" for d in planned_detail) + role
     else:
         plan = f"План: {s['planned_weight']} кг × {s['planned_reps']} {unit} × {s['planned_sets']} подх{role}"
 
@@ -865,7 +939,7 @@ def _fmt_progression_session_line(s, rep_unit: str) -> str:
         if isinstance(actual_detail, str):
             actual_detail = json.loads(actual_detail)
         if actual_detail:
-            fact = "Факт: " + "; ".join(f"{d['weight']} кг × {d['reps']} {unit}" for d in actual_detail)
+            fact = "Факт: " + "; ".join(_fmt_set_line(d) or "—" for d in actual_detail)
         else:
             fact = f"Факт: {s['actual_weight']} кг × {s['actual_reps']} {unit} × {s['actual_sets']} подх"
         return f"{plan}  →  {fact}"
@@ -877,7 +951,7 @@ def _fmt_progression_session_line(s, rep_unit: str) -> str:
 def _build_progression_export(progression_rows_with_sessions) -> list:
     lines = []
     for prog, sessions in progression_rows_with_sessions:
-        status = {"active": "активна", "completed": "завершена", "archived": "в архиве"}.get(prog["status"], prog["status"])
+        status = {"active": "активна", "completed": "завершена"}.get(prog["status"], prog["status"])
         mode = "произвольная" if prog["mode"] == "manual" else "расчётная"
         lines.append(f"• {prog['exercise_name']} — {mode}, {status}")
         if prog["mode"] == "calculated":
@@ -1319,6 +1393,9 @@ def _get_owned_progression(conn, pid: int, progression_id: int):
 def _serialize_progression(row) -> dict:
     d = dict(row)
     d["deload_enabled"] = bool(d.get("deload_enabled"))
+    d["unilateral"] = bool(d.get("unilateral"))
+    if d.get("current_reps_detail"):
+        d["current_reps_detail"] = json.loads(d["current_reps_detail"])
     return d
 
 
@@ -1342,11 +1419,24 @@ def _maybe_complete(conn, progression_id: int):
                      (progression_id,))
 
 
-def _insert_sessions(conn, progression_id: int, sessions):
+def _insert_sessions(conn, progression_id: int, sessions, unilateral: bool = False, display_sets_count=None):
+    """sessions: список (session_index, role, planned_weight, planned_reps_detail, planned_sets).
+    Для unilateral=True planned_reps_detail — уже "плоский" список длиной 2*display_sets_count
+    (см. модуль про унилатеральный режим выше), display_sets_count — истинное число физических
+    подходов (для колонки planned_sets, которая не должна задваиваться)."""
+    rows = []
+    for idx, role, w, reps_detail, sets_count in sessions:
+        if unilateral:
+            detail = _pack_unilateral_detail(w, reps_detail)
+            planned_sets = display_sets_count if display_sets_count is not None else sets_count
+        else:
+            detail = [{"weight": w, "reps": r} for r in reps_detail]
+            planned_sets = sets_count
+        rows.append((progression_id, idx, role, w, reps_detail[0], planned_sets,
+                     json.dumps(detail, ensure_ascii=False)))
     conn.executemany(
-        "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets) "
-        "VALUES (?,?,?,?,?,?)",
-        [(progression_id, idx, role, w, r, s) for idx, role, w, r, s in sessions]
+        "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets, planned_detail) "
+        "VALUES (?,?,?,?,?,?,?)", rows
     )
 
 
@@ -1378,7 +1468,7 @@ def list_progressions(x_init_data: str = Header(...)):
         pid = get_active_profile_id(conn, uid)
         _require_premium(conn, uid)
         rows = conn.execute(
-            "SELECT * FROM progressions WHERE profile_id=? AND status!='archived' ORDER BY id DESC", (pid,)
+            "SELECT * FROM progressions WHERE profile_id=? ORDER BY id DESC", (pid,)
         ).fetchall()
         result = []
         for r in rows:
@@ -1443,17 +1533,20 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             raise HTTPException(400, "Для этого типа упражнения частота — от 1 до 4 раз в неделю")
 
         total_sessions = body.weeks * body.frequency
+        eff_sets = body.sets_count * 2 if body.unilateral else body.sets_count
+        start_reps_detail = [body.start_reps] * eff_sets
         try:
             cur = conn.execute(
                 "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
                 "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
-                "increment, start_weight, start_reps, start_rir, total_sessions, deload_enabled, "
-                "current_weight, current_reps) "
-                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "increment, start_weight, start_reps, start_rir, total_sessions, deload_enabled, unilateral, "
+                "current_weight, current_reps, current_reps_detail) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, name, name_lc, body.exercise_type, body.goal, body.rep_unit,
                  body.rep_range_low, body.rep_range_high, body.frequency, body.sets_count,
                  body.increment, body.start_weight, body.start_reps, body.start_rir,
-                 total_sessions, int(body.deload_enabled), body.start_weight, body.start_reps)
+                 total_sessions, int(body.deload_enabled), int(body.unilateral),
+                 body.start_weight, body.start_reps, json.dumps(start_reps_detail))
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
@@ -1461,9 +1554,9 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
 
         sessions = generate_remaining_sessions(
             body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
-            body.increment, body.sets_count, total_sessions, 1, body.start_weight, body.start_reps
+            body.increment, eff_sets, total_sessions, 1, body.start_weight, start_reps_detail
         )
-        _insert_sessions(conn, new_id, sessions)
+        _insert_sessions(conn, new_id, sessions, unilateral=body.unilateral, display_sets_count=body.sets_count)
         return {"ok": True, "id": new_id}
 
 
@@ -1514,32 +1607,38 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
             (progression_id,)
         ).fetchone()["i"]
         if nxt is not None:
-            cw, cr = prog["current_weight"], prog["current_reps"]
-            # проецируем текущую точку в новый диапазон, если она за его пределами
-            if cr > high:
-                cw, cr = normalize_overflow(cw, cr, low, high, increment)
-            elif cr < low:
-                cr = low
-            conn.execute("UPDATE progressions SET current_weight=?, current_reps=? WHERE id=?", (cw, cr, progression_id))
+            cw = prog["current_weight"]
+            eff_sets = sets_count * 2 if prog["unilateral"] else sets_count
+            detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"] or low] * (prog["sets_count"] or 1)
+            cw, detail = normalize_range_detail(cw, detail, low, high, increment)
+            if len(detail) < eff_sets:
+                detail = detail + [detail[-1]] * (eff_sets - len(detail))
+            elif len(detail) > eff_sets:
+                detail = detail[:eff_sets]
+            conn.execute(
+                "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=? WHERE id=?",
+                (cw, detail[0], json.dumps(detail), progression_id)
+            )
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,)
             )
             sessions = generate_remaining_sessions(
-                prog["exercise_type"], frequency, low, high, increment, sets_count,
-                prog["total_sessions"], nxt, cw, cr
+                prog["exercise_type"], frequency, low, high, increment, eff_sets,
+                prog["total_sessions"], nxt, cw, detail
             )
-            _insert_sessions(conn, progression_id, sessions)
+            _insert_sessions(conn, progression_id, sessions, unilateral=bool(prog["unilateral"]), display_sets_count=sets_count)
     return {"ok": True}
 
 
-@app.post("/progressions/{progression_id}/archive")
-def archive_progression(progression_id: int, x_init_data: str = Header(...)):
+@app.delete("/progressions/{progression_id}")
+def delete_progression(progression_id: int, x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
         _require_premium(conn, uid)
         _get_owned_progression(conn, pid, progression_id)
-        conn.execute("UPDATE progressions SET status='archived', updated_at=datetime('now') WHERE id=?", (progression_id,))
+        conn.execute("DELETE FROM progression_sessions WHERE progression_id=?", (progression_id,))
+        conn.execute("DELETE FROM progressions WHERE id=?", (progression_id,))
     return {"ok": True}
 
 
@@ -1558,23 +1657,60 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
         if session["status"] != "pending":
             raise HTTPException(400, "Эта сессия уже отыграна или пропущена")
 
+        uni = bool(prog["unilateral"])
+        if body.actual_detail and uni:
+            # для отображения факта пользователю сохраняем в исходной Л/П форме, а не
+            # в "рассортированной по слабой/сильной стороне" — та нужна только для расчёта
+            stored_detail = [
+                {"weightL": s.weightL if s.weightL is not None else s.weight,
+                 "repsL": s.repsL if s.repsL is not None else s.reps,
+                 "weightR": s.weightR if s.weightR is not None else s.weight,
+                 "repsR": s.repsR if s.repsR is not None else s.reps,
+                 "bilateral": True}
+                for s in body.actual_detail
+            ]
+        else:
+            stored_detail = [{"weight": s.weight, "reps": s.reps} for s in body.actual_detail] if body.actual_detail else None
+
         conn.execute(
             "UPDATE progression_sessions SET status='done', actual_weight=?, actual_reps=?, actual_sets=?, "
             "actual_rir=?, workout_id=?, actual_detail=?, completed_at=datetime('now') WHERE id=?",
             (body.actual_weight, body.actual_reps, body.actual_sets, body.actual_rir, body.workout_id,
-             json.dumps([{"weight": s.weight, "reps": s.reps} for s in body.actual_detail], ensure_ascii=False) if body.actual_detail else None,
+             json.dumps(stored_detail, ensure_ascii=False) if stored_detail else None,
              session_id)
         )
 
         if prog["mode"] == "calculated" and session["role"] in (None, "heavy"):
-            new_w, new_r, new_fail = adapt_actual(
-                session["planned_weight"], session["planned_reps"], session["planned_sets"],
-                body.actual_weight, body.actual_reps, body.actual_sets,
+            eff_sets = prog["sets_count"] * 2 if uni else prog["sets_count"]
+            if session["planned_detail"]:
+                pd = json.loads(session["planned_detail"])
+                planned_reps_detail = [x for d in pd for x in (d["repsL"], d["repsR"])] if uni else [d["reps"] for d in pd]
+            else:
+                planned_reps_detail = [session["planned_reps"]] * eff_sets
+
+            if body.actual_detail:
+                if uni:
+                    actual_records = [{"weight": s.weight, "reps": s.reps, "weightL": s.weightL,
+                                        "repsL": s.repsL, "weightR": s.weightR, "repsR": s.repsR}
+                                       for s in body.actual_detail]
+                    _, actual_detail = _unpack_unilateral_actual(actual_records)
+                else:
+                    actual_detail = [{"weight": s.weight, "reps": s.reps} for s in body.actual_detail]
+            else:
+                # фолбэк на случай, если фронт не прислал детализацию по подходам —
+                # раскладываем агрегат на нужное число подходов одним и тем же значением
+                actual_detail = [{"weight": body.actual_weight, "reps": body.actual_reps}] * (body.actual_sets or 1)
+                if uni:
+                    actual_detail = actual_detail * 2  # без детализации по сторонам считаем обе стороны равными
+
+            new_w, new_r, new_fail = adapt_actual_detail(
+                session["planned_weight"], planned_reps_detail, actual_detail,
                 prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
             )
             conn.execute(
-                "UPDATE progressions SET current_weight=?, current_reps=?, fail_streak=?, updated_at=datetime('now') WHERE id=?",
-                (new_w, new_r, new_fail, progression_id)
+                "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
+                "fail_streak=?, updated_at=datetime('now') WHERE id=?",
+                (new_w, new_r[0], json.dumps(new_r), new_fail, progression_id)
             )
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
@@ -1583,10 +1719,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
             if session["session_index"] < prog["total_sessions"]:
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], prog["sets_count"], prog["total_sessions"],
+                    prog["increment"], eff_sets, prog["total_sessions"],
                     session["session_index"] + 1, new_w, new_r
                 )
-                _insert_sessions(conn, progression_id, sessions)
+                _insert_sessions(conn, progression_id, sessions, unilateral=uni, display_sets_count=prog["sets_count"])
 
         _maybe_complete(conn, progression_id)
 
@@ -1637,21 +1773,36 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
         )
 
         if prog["mode"] == "calculated" and target["role"] in (None, "heavy"):
-            # переигрываем историю до target, чтобы честно восстановить current_weight/current_reps
-            w, r, fail = prog["start_weight"], prog["start_reps"], 0
+            # переигрываем историю до target, чтобы честно восстановить current_weight/current_reps_detail
+            uni = bool(prog["unilateral"])
+            eff_sets = prog["sets_count"] * 2 if uni else prog["sets_count"]
+            w = prog["start_weight"]
+            r = [prog["start_reps"]] * eff_sets
+            fail = 0
             for s in sessions:
                 if s["session_index"] >= target["session_index"]:
                     break
                 if s["status"] == "done" and s["role"] in (None, "heavy"):
-                    w, r, fail = adapt_actual(
-                        s["planned_weight"], s["planned_reps"], s["planned_sets"],
-                        s["actual_weight"], s["actual_reps"], s["actual_sets"],
+                    if s["planned_detail"]:
+                        pd = json.loads(s["planned_detail"])
+                        planned_reps_detail = [x for d in pd for x in (d["repsL"], d["repsR"])] if uni else [d["reps"] for d in pd]
+                    else:
+                        planned_reps_detail = [s["planned_reps"]] * eff_sets
+                    if s["actual_detail"]:
+                        stored = json.loads(s["actual_detail"])
+                        actual_detail = _unpack_unilateral_actual(stored)[1] if uni else stored
+                    else:
+                        actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
+                        if uni:
+                            actual_detail = actual_detail * 2
+                    w, r, fail = adapt_actual_detail(
+                        s["planned_weight"], planned_reps_detail, actual_detail,
                         prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
                     )
             conn.execute(
-                "UPDATE progressions SET current_weight=?, current_reps=?, fail_streak=?, status='active', "
-                "updated_at=datetime('now') WHERE id=?",
-                (w, r, fail, progression_id)
+                "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
+                "status='active', updated_at=datetime('now') WHERE id=?",
+                (w, r[0], json.dumps(r), fail, progression_id)
             )
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
@@ -1659,9 +1810,9 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
             )
             new_sessions = generate_remaining_sessions(
                 prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                prog["increment"], prog["sets_count"], prog["total_sessions"], target["session_index"], w, r
+                prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r
             )
-            _insert_sessions(conn, progression_id, new_sessions)
+            _insert_sessions(conn, progression_id, new_sessions, unilateral=uni, display_sets_count=prog["sets_count"])
         else:
             conn.execute("UPDATE progressions SET status='active' WHERE id=? AND status='completed'", (progression_id,))
     return {"ok": True}
@@ -1686,25 +1837,33 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
         deload      = body.deload_enabled if body.deload_enabled is not None else bool(prog["deload_enabled"])
         weeks       = body.weeks if body.weeks is not None else max(1, (prog["total_sessions"] or frequency) // (prog["frequency"] or 1))
         total_sessions = weeks * frequency
-        start_w, start_r = prog["current_weight"], prog["current_reps"]
+        uni = bool(prog["unilateral"])
+        eff_sets = sets_count * 2 if uni else sets_count
+        start_w = prog["current_weight"]
+        start_r_detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * (prog["sets_count"] or 1)
+        if len(start_r_detail) < eff_sets:
+            start_r_detail = start_r_detail + [start_r_detail[-1]] * (eff_sets - len(start_r_detail))
+        elif len(start_r_detail) > eff_sets:
+            start_r_detail = start_r_detail[:eff_sets]
 
         try:
             cur = conn.execute(
                 "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
                 "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
-                "increment, start_weight, start_reps, total_sessions, deload_enabled, current_weight, current_reps) "
-                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, current_weight, "
+                "current_reps, current_reps_detail) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
-                 low, high, frequency, sets_count, increment, start_w, start_r, total_sessions, int(deload),
-                 start_w, start_r)
+                 low, high, frequency, sets_count, increment, start_w, start_r_detail[0], total_sessions, int(deload),
+                 int(uni), start_w, start_r_detail[0], json.dumps(start_r_detail))
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
         new_id = cur.lastrowid
         sessions = generate_remaining_sessions(
-            prog["exercise_type"], frequency, low, high, increment, sets_count, total_sessions, 1, start_w, start_r
+            prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail
         )
-        _insert_sessions(conn, new_id, sessions)
+        _insert_sessions(conn, new_id, sessions, unilateral=uni, display_sets_count=sets_count)
     return {"ok": True, "id": new_id}
 
 

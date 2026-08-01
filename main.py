@@ -189,6 +189,8 @@ def init_db():
                 current_reps     INTEGER,
                 current_reps_detail TEXT,
                 unilateral       INTEGER NOT NULL DEFAULT 0,
+                beginner_mode    INTEGER NOT NULL DEFAULT 0,
+                amrap_every_weeks INTEGER,
                 fail_streak      INTEGER NOT NULL DEFAULT 0,
 
                 created_at       TEXT NOT NULL DEFAULT (datetime('now')),
@@ -215,6 +217,7 @@ def init_db():
                 completed_at    TEXT,
                 planned_detail  TEXT,
                 actual_detail   TEXT,
+                is_amrap        INTEGER NOT NULL DEFAULT 0,
 
                 UNIQUE(progression_id, session_index)
             );
@@ -225,6 +228,13 @@ def init_db():
             conn.execute("ALTER TABLE progressions ADD COLUMN current_reps_detail TEXT")
         if "unilateral" not in cols:
             conn.execute("ALTER TABLE progressions ADD COLUMN unilateral INTEGER NOT NULL DEFAULT 0")
+        if "beginner_mode" not in cols:
+            conn.execute("ALTER TABLE progressions ADD COLUMN beginner_mode INTEGER NOT NULL DEFAULT 0")
+        if "amrap_every_weeks" not in cols:
+            conn.execute("ALTER TABLE progressions ADD COLUMN amrap_every_weeks INTEGER")
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(progression_sessions)").fetchall()]
+        if "is_amrap" not in cols:
+            conn.execute("ALTER TABLE progression_sessions ADD COLUMN is_amrap INTEGER NOT NULL DEFAULT 0")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(workouts)").fetchall()]
         if "profile_id" not in cols:
             conn.execute("ALTER TABLE workouts ADD COLUMN profile_id INTEGER")
@@ -469,6 +479,77 @@ def _unpack_unilateral_actual(actual_detail: list):
     return weight, flat
 
 
+# ── RIR и режим новичка: тоже пост-обработка, а не изменение ядра ───────────
+# Оба модификатора смотрят только на РЕЗУЛЬТАТ adapt_actual_detail (сработал Step Up
+# или нет — определяется просто сравнением new_weight с planned_weight) и либо
+# усиливают шаг, либо, в случае RIR=0, откатывают Step Up обратно к "держим потолок
+# диапазона ещё раз". Hold и Step Down эти модификаторы не трогают вообще.
+
+def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, high, increment,
+                              rir, beginner_mode: bool):
+    """rir — по первому (диагностическому) подходу, необязателен (см. решение сделать RIR
+    опциональным); beginner_mode — активен до первого исхода, который не Step Up."""
+    if new_weight <= planned_weight:
+        return new_weight, new_reps_detail
+    step = new_weight - planned_weight
+    if beginner_mode:
+        step *= 2
+        new_weight = round_to_increment(planned_weight + step, increment)
+    if rir is not None:
+        if rir <= 0:
+            # формально выполнил план, но каждый подход "в отказ" — не спешим с весом,
+            # держим ещё один заход на потолке диапазона
+            return planned_weight, [high] * len(new_reps_detail)
+        if rir >= 3:
+            # с большим запасом сил — не тратим недели на подъём по одному шагу
+            new_weight = round_to_increment(new_weight + step, increment)
+    return new_weight, new_reps_detail
+
+
+# ── AMRAP-тест (идея Лайла Макдональда): периодическая объективная проверка ──
+# Раз в N недель heavy-сессия становится тестовой: обычный план по подходам, но
+# последний подход — в отказ (AMRAP). Вместо покошагового Step Up дальнейший
+# рабочий вес пересчитывается от РЕАЛЬНОГО 1ПМ (форм. Эпли), а не от одного
+# инкремента — так быстрее ловим случаи, когда обычная прогрессия отстаёт от
+# реального роста силы (или, наоборот, забежала вперёд).
+# Не совместим с unilateral в этой версии — сознательно, чтобы не плодить
+# комбинаторику "AMRAP по каждой стороне" без реального запроса на неё.
+
+AMRAP_BREAKTHROUGH_PCT = 0.08   # дельта факт/прогноз 1ПМ, после которой считаем это прорывом
+AMRAP_SETBACK_PCT = -0.08       # и наоборот — заметной просадкой
+
+
+def epley_1rm(weight: float, reps: int) -> float:
+    return weight * (1 + reps / 30)
+
+
+def is_amrap_session(session_index: int, frequency: int, amrap_every_weeks):
+    """Каждая первая heavy-сессия недели (phase==0 в role_template — см. generate_remaining_sessions)
+    считающейся недели становится AMRAP-тестом. None/0 — тест выключен."""
+    if not amrap_every_weeks:
+        return False
+    freq = frequency or 1
+    week = ((session_index - 1) // freq) + 1
+    phase = (session_index - 1) % freq
+    return phase == 0 and week % amrap_every_weeks == 0
+
+
+def adapt_amrap(planned_weight, high, low, increment, actual_weight, actual_reps):
+    """Последний (AMRAP) подход теста -> новая рабочая точка. Прогноз 1ПМ берём от
+    текущего плана на верху диапазона повторов, сравниваем с фактическим 1ПМ."""
+    predicted_1rm = epley_1rm(planned_weight, high)
+    actual_1rm = epley_1rm(actual_weight, actual_reps)
+    delta = (actual_1rm - predicted_1rm) / predicted_1rm if predicted_1rm else 0
+
+    if delta >= AMRAP_BREAKTHROUGH_PCT:
+        new_weight = round_to_increment(actual_1rm / (1 + low / 30), increment)
+    elif delta <= AMRAP_SETBACK_PCT:
+        new_weight = round_to_increment(planned_weight * 0.95, increment)
+    else:
+        new_weight = round_to_increment(planned_weight + increment, increment)
+    return new_weight
+
+
 # ── Модели ────────────────────────────────────────────────────────────────────
 
 class WorkoutIn(BaseModel):
@@ -542,6 +623,8 @@ class ProgressionCreateIn(BaseModel):
     weeks:          Optional[int] = None       # длительность цикла в неделях (total_sessions = weeks*frequency)
     deload_enabled: bool = False
     unilateral:     bool = False               # раздельный учёт по сторонам (см. _pack_unilateral_detail)
+    beginner_mode:  bool = False                # удвоенный шаг Step Up, выключается сам после первого не-UP
+    amrap_every_weeks: Optional[int] = None     # раз в N недель heavy-сессия становится AMRAP-тестом; несовместимо с unilateral
     # manual:
     manual_sessions: list[ManualSessionIn] = []
 
@@ -553,6 +636,12 @@ class ProgressionEditIn(BaseModel):
     sets_count:     Optional[int] = None
     increment:      Optional[float] = None
     deload_enabled: Optional[bool] = None
+    amrap_every_weeks: Optional[int] = None
+
+class ResetStartIn(BaseModel):
+    start_weight:  float
+    start_reps:    int
+    beginner_mode: bool = False
 
 class SessionLogIn(BaseModel):
     actual_weight: float
@@ -1394,6 +1483,7 @@ def _serialize_progression(row) -> dict:
     d = dict(row)
     d["deload_enabled"] = bool(d.get("deload_enabled"))
     d["unilateral"] = bool(d.get("unilateral"))
+    d["beginner_mode"] = bool(d.get("beginner_mode"))
     if d.get("current_reps_detail"):
         d["current_reps_detail"] = json.loads(d["current_reps_detail"])
     return d
@@ -1405,25 +1495,54 @@ def _serialize_session(row) -> dict:
         d["planned_detail"] = json.loads(d["planned_detail"])
     if d.get("actual_detail"):
         d["actual_detail"] = json.loads(d["actual_detail"])
+    d["is_amrap"] = bool(d.get("is_amrap"))
     return d
 
 
-def _maybe_complete(conn, progression_id: int):
-    """Если все сессии done/skipped — цикл завершён."""
+TOPUP_THRESHOLD_WEEKS = 2   # доливаем горизонт, когда осталось меньше этого числа недель
+TOPUP_EXTEND_WEEKS     = 4  # на сколько недель вперёд доливаем за раз
+
+
+def _maybe_complete_or_topup(conn, progression_id: int):
+    """Ручной режим — как раньше: закончились сессии -> цикл завершён.
+    Расчётный режим сам никогда не завершается — вместо этого тихо доливает горизонт
+    планирования, когда впереди осталось мало сессий. Завершить его теперь можно только
+    явно, через /progressions/{id}/complete."""
+    prog = conn.execute("SELECT * FROM progressions WHERE id=?", (progression_id,)).fetchone()
+    if not prog or prog["status"] != "active":
+        return
     left = conn.execute(
         "SELECT COUNT(*) c FROM progression_sessions WHERE progression_id=? AND status='pending'",
         (progression_id,)
     ).fetchone()["c"]
-    if left == 0:
-        conn.execute("UPDATE progressions SET status='completed', updated_at=datetime('now') WHERE id=? AND status='active'",
-                     (progression_id,))
+    if prog["mode"] == "manual":
+        if left == 0:
+            conn.execute("UPDATE progressions SET status='completed', updated_at=datetime('now') WHERE id=?", (progression_id,))
+        return
+
+    freq = prog["frequency"] or 1
+    if left >= freq * TOPUP_THRESHOLD_WEEKS:
+        return
+    uni = bool(prog["unilateral"])
+    eff_sets = (prog["sets_count"] or 1) * 2 if uni else (prog["sets_count"] or 1)
+    detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
+    new_total = prog["total_sessions"] + freq * TOPUP_EXTEND_WEEKS
+    sessions = generate_remaining_sessions(
+        prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
+        eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
+    )
+    _insert_sessions(conn, progression_id, sessions, unilateral=uni, display_sets_count=prog["sets_count"],
+                      frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
+    conn.execute("UPDATE progressions SET total_sessions=? WHERE id=?", (new_total, progression_id))
 
 
-def _insert_sessions(conn, progression_id: int, sessions, unilateral: bool = False, display_sets_count=None):
+def _insert_sessions(conn, progression_id: int, sessions, unilateral: bool = False, display_sets_count=None,
+                      frequency=None, amrap_every_weeks=None):
     """sessions: список (session_index, role, planned_weight, planned_reps_detail, planned_sets).
     Для unilateral=True planned_reps_detail — уже "плоский" список длиной 2*display_sets_count
     (см. модуль про унилатеральный режим выше), display_sets_count — истинное число физических
-    подходов (для колонки planned_sets, которая не должна задваиваться)."""
+    подходов (для колонки planned_sets, которая не должна задваиваться). frequency+amrap_every_weeks —
+    если передан amrap_every_weeks, размечаем подходящие сессии как AMRAP-тест."""
     rows = []
     for idx, role, w, reps_detail, sets_count in sessions:
         if unilateral:
@@ -1432,11 +1551,12 @@ def _insert_sessions(conn, progression_id: int, sessions, unilateral: bool = Fal
         else:
             detail = [{"weight": w, "reps": r} for r in reps_detail]
             planned_sets = sets_count
+        amrap = int(is_amrap_session(idx, frequency, amrap_every_weeks)) if amrap_every_weeks else 0
         rows.append((progression_id, idx, role, w, reps_detail[0], planned_sets,
-                     json.dumps(detail, ensure_ascii=False)))
+                     json.dumps(detail, ensure_ascii=False), amrap))
     conn.executemany(
-        "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets, planned_detail) "
-        "VALUES (?,?,?,?,?,?,?)", rows
+        "INSERT INTO progression_sessions (progression_id, session_index, role, planned_weight, planned_reps, planned_sets, planned_detail, is_amrap) "
+        "VALUES (?,?,?,?,?,?,?,?)", rows
     )
 
 
@@ -1531,6 +1651,8 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             raise HTTPException(400, "Некорректные числовые параметры")
         if body.exercise_type in VARYING_TYPES and body.frequency not in (1, 2, 3, 4):
             raise HTTPException(400, "Для этого типа упражнения частота — от 1 до 4 раз в неделю")
+        if body.unilateral and body.amrap_every_weeks:
+            raise HTTPException(400, "AMRAP-тест пока не поддерживается для унилатеральных прогрессий")
 
         total_sessions = body.weeks * body.frequency
         eff_sets = body.sets_count * 2 if body.unilateral else body.sets_count
@@ -1540,13 +1662,13 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
                 "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
                 "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
                 "increment, start_weight, start_reps, start_rir, total_sessions, deload_enabled, unilateral, "
-                "current_weight, current_reps, current_reps_detail) "
-                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "beginner_mode, amrap_every_weeks, current_weight, current_reps, current_reps_detail) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, name, name_lc, body.exercise_type, body.goal, body.rep_unit,
                  body.rep_range_low, body.rep_range_high, body.frequency, body.sets_count,
                  body.increment, body.start_weight, body.start_reps, body.start_rir,
-                 total_sessions, int(body.deload_enabled), int(body.unilateral),
-                 body.start_weight, body.start_reps, json.dumps(start_reps_detail))
+                 total_sessions, int(body.deload_enabled), int(body.unilateral), int(body.beginner_mode),
+                 body.amrap_every_weeks, body.start_weight, body.start_reps, json.dumps(start_reps_detail))
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
@@ -1556,7 +1678,8 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
             body.increment, eff_sets, total_sessions, 1, body.start_weight, start_reps_detail
         )
-        _insert_sessions(conn, new_id, sessions, unilateral=body.unilateral, display_sets_count=body.sets_count)
+        _insert_sessions(conn, new_id, sessions, unilateral=body.unilateral, display_sets_count=body.sets_count,
+                          frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
         return {"ok": True, "id": new_id}
 
 
@@ -1593,13 +1716,16 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
         sets_count    = body.sets_count if body.sets_count is not None else prog["sets_count"]
         increment     = body.increment if body.increment is not None else prog["increment"]
         deload        = body.deload_enabled if body.deload_enabled is not None else bool(prog["deload_enabled"])
+        amrap_weeks   = body.amrap_every_weeks if body.amrap_every_weeks is not None else prog["amrap_every_weeks"]
         if high <= low:
             raise HTTPException(400, "Верх диапазона повторов должен быть больше низа")
+        if prog["unilateral"] and amrap_weeks:
+            raise HTTPException(400, "AMRAP-тест пока не поддерживается для унилатеральных прогрессий")
 
         conn.execute(
             "UPDATE progressions SET goal=?, rep_range_low=?, rep_range_high=?, frequency=?, sets_count=?, "
-            "increment=?, deload_enabled=?, updated_at=datetime('now') WHERE id=?",
-            (goal, low, high, frequency, sets_count, increment, int(deload), progression_id)
+            "increment=?, deload_enabled=?, amrap_every_weeks=?, updated_at=datetime('now') WHERE id=?",
+            (goal, low, high, frequency, sets_count, increment, int(deload), amrap_weeks, progression_id)
         )
 
         nxt = conn.execute(
@@ -1626,7 +1752,8 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 prog["exercise_type"], frequency, low, high, increment, eff_sets,
                 prog["total_sessions"], nxt, cw, detail
             )
-            _insert_sessions(conn, progression_id, sessions, unilateral=bool(prog["unilateral"]), display_sets_count=sets_count)
+            _insert_sessions(conn, progression_id, sessions, unilateral=bool(prog["unilateral"]), display_sets_count=sets_count,
+                              frequency=frequency, amrap_every_weeks=amrap_weeks)
     return {"ok": True}
 
 
@@ -1703,14 +1830,32 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 if uni:
                     actual_detail = actual_detail * 2  # без детализации по сторонам считаем обе стороны равными
 
-            new_w, new_r, new_fail = adapt_actual_detail(
-                session["planned_weight"], planned_reps_detail, actual_detail,
-                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
-            )
+            if session["is_amrap"] and not uni and body.actual_detail:
+                last = body.actual_detail[-1]
+                new_w = adapt_amrap(
+                    session["planned_weight"], prog["rep_range_high"], prog["rep_range_low"],
+                    prog["increment"], last.weight, last.reps
+                )
+                new_r = [prog["rep_range_low"]] * eff_sets
+                new_fail = 0
+                was_beginner = bool(prog["beginner_mode"])
+                still_beginner = was_beginner and new_w > session["planned_weight"]
+            else:
+                new_w, new_r, new_fail = adapt_actual_detail(
+                    session["planned_weight"], planned_reps_detail, actual_detail,
+                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
+                )
+                was_beginner = bool(prog["beginner_mode"])
+                new_w, new_r = apply_progress_modifiers(
+                    new_w, new_r, session["planned_weight"], prog["rep_range_high"], prog["increment"],
+                    body.actual_rir, was_beginner
+                )
+                # режим новичка живёт до первого исхода, который не Step Up (после модификаторов)
+                still_beginner = was_beginner and new_w > session["planned_weight"]
             conn.execute(
                 "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
-                "fail_streak=?, updated_at=datetime('now') WHERE id=?",
-                (new_w, new_r[0], json.dumps(new_r), new_fail, progression_id)
+                "fail_streak=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                (new_w, new_r[0], json.dumps(new_r), new_fail, int(still_beginner), progression_id)
             )
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
@@ -1722,9 +1867,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     prog["increment"], eff_sets, prog["total_sessions"],
                     session["session_index"] + 1, new_w, new_r
                 )
-                _insert_sessions(conn, progression_id, sessions, unilateral=uni, display_sets_count=prog["sets_count"])
+                _insert_sessions(conn, progression_id, sessions, unilateral=uni, display_sets_count=prog["sets_count"],
+                                  frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
 
-        _maybe_complete(conn, progression_id)
+        _maybe_complete_or_topup(conn, progression_id)
 
         updated = _get_owned_progression(conn, pid, progression_id)
         sessions_rows = conn.execute(
@@ -1748,7 +1894,7 @@ def skip_progression_session(progression_id: int, session_id: int, x_init_data: 
         if not session or session["status"] != "pending":
             raise HTTPException(400, "Сессию нельзя пропустить")
         conn.execute("UPDATE progression_sessions SET status='skipped' WHERE id=?", (session_id,))
-        _maybe_complete(conn, progression_id)
+        _maybe_complete_or_topup(conn, progression_id)
     return {"ok": True}
 
 
@@ -1779,6 +1925,11 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
             w = prog["start_weight"]
             r = [prog["start_reps"]] * eff_sets
             fail = 0
+            # Точную историческую траекторию beginner_mode по сессиям мы не храним — берём
+            # текущее значение как допущение для всего replay. Неточность возможна только в
+            # редком случае отмены именно той сессии, которая сама выключила режим новичка;
+            # на дальнейший расчёт после реального следующего лога это не влияет.
+            beginner = bool(prog["beginner_mode"])
             for s in sessions:
                 if s["session_index"] >= target["session_index"]:
                     break
@@ -1795,14 +1946,27 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
                         if uni:
                             actual_detail = actual_detail * 2
-                    w, r, fail = adapt_actual_detail(
-                        s["planned_weight"], planned_reps_detail, actual_detail,
-                        prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
-                    )
+                    planned_w_at_the_time = s["planned_weight"]
+                    if s["is_amrap"] and not uni and actual_detail:
+                        last = actual_detail[-1]
+                        w = adapt_amrap(planned_w_at_the_time, prog["rep_range_high"], prog["rep_range_low"],
+                                        prog["increment"], last["weight"], last["reps"])
+                        r = [prog["rep_range_low"]] * eff_sets
+                        fail = 0
+                    else:
+                        w, r, fail = adapt_actual_detail(
+                            planned_w_at_the_time, planned_reps_detail, actual_detail,
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
+                        )
+                        w, r = apply_progress_modifiers(
+                            w, r, planned_w_at_the_time, prog["rep_range_high"], prog["increment"],
+                            s["actual_rir"], beginner
+                        )
+                    beginner = beginner and w > planned_w_at_the_time
             conn.execute(
                 "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
-                "status='active', updated_at=datetime('now') WHERE id=?",
-                (w, r[0], json.dumps(r), fail, progression_id)
+                "beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
+                (w, r[0], json.dumps(r), fail, int(beginner), progression_id)
             )
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
@@ -1812,7 +1976,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                 prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r
             )
-            _insert_sessions(conn, progression_id, new_sessions, unilateral=uni, display_sets_count=prog["sets_count"])
+            _insert_sessions(conn, progression_id, new_sessions, unilateral=uni, display_sets_count=prog["sets_count"],
+                              frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
         else:
             conn.execute("UPDATE progressions SET status='active' WHERE id=? AND status='completed'", (progression_id,))
     return {"ok": True}
@@ -1850,12 +2015,12 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
             cur = conn.execute(
                 "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
                 "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
-                "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, current_weight, "
-                "current_reps, current_reps_detail) "
-                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, amrap_every_weeks, "
+                "current_weight, current_reps, current_reps_detail) "
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
                  low, high, frequency, sets_count, increment, start_w, start_r_detail[0], total_sessions, int(deload),
-                 int(uni), start_w, start_r_detail[0], json.dumps(start_r_detail))
+                 int(uni), prog["amrap_every_weeks"], start_w, start_r_detail[0], json.dumps(start_r_detail))
             )
         except sqlite3.IntegrityError:
             raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
@@ -1863,8 +2028,82 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
         sessions = generate_remaining_sessions(
             prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail
         )
-        _insert_sessions(conn, new_id, sessions, unilateral=uni, display_sets_count=sets_count)
+        _insert_sessions(conn, new_id, sessions, unilateral=uni, display_sets_count=sets_count,
+                          frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
     return {"ok": True, "id": new_id}
+
+
+@app.post("/progressions/{progression_id}/reset-start")
+def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data: str = Header(...)):
+    """Сбросить текущую точку прогрессии (вес/повторы) без потери истории — для случаев
+    вроде "переоценил силы со старта" или "возвращаюсь после перерыва"."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        if prog["mode"] != "calculated" or prog["status"] != "active":
+            raise HTTPException(400, "Сбросить старт можно только для активной расчётной прогрессии")
+        uni = bool(prog["unilateral"])
+        eff_sets = (prog["sets_count"] or 1) * 2 if uni else (prog["sets_count"] or 1)
+        new_detail = [body.start_reps] * eff_sets
+        conn.execute(
+            "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=0, "
+            "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+            (body.start_weight, body.start_reps, json.dumps(new_detail), int(body.beginner_mode), progression_id)
+        )
+        nxt = conn.execute(
+            "SELECT MIN(session_index) i FROM progression_sessions WHERE progression_id=? AND status='pending'",
+            (progression_id,)
+        ).fetchone()["i"]
+        if nxt is not None:
+            conn.execute("DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,))
+            sessions = generate_remaining_sessions(
+                prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail
+            )
+            _insert_sessions(conn, progression_id, sessions, unilateral=uni, display_sets_count=prog["sets_count"],
+                              frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/flag-amrap")
+def flag_amrap_session(progression_id: int, x_init_data: str = Header(...)):
+    """Пометить ближайшую pending heavy-сессию как AMRAP-тест вручную, вне периодического
+    расписания — "хочу проверить силу прямо сейчас"."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        if prog["mode"] != "calculated" or prog["status"] != "active":
+            raise HTTPException(400, "AMRAP-тест доступен только для активной расчётной прогрессии")
+        if prog["unilateral"]:
+            raise HTTPException(400, "AMRAP-тест пока не поддерживается для унилатеральных прогрессий")
+        nxt = conn.execute(
+            "SELECT id FROM progression_sessions WHERE progression_id=? AND status='pending' "
+            "AND (role='heavy' OR role IS NULL) ORDER BY session_index LIMIT 1",
+            (progression_id,)
+        ).fetchone()
+        if not nxt:
+            raise HTTPException(400, "Нет ближайшей heavy-сессии, которую можно пометить")
+        conn.execute("UPDATE progression_sessions SET is_amrap=1 WHERE id=?", (nxt["id"],))
+    return {"ok": True}
+
+
+@app.post("/progressions/{progression_id}/complete")
+def complete_progression(progression_id: int, x_init_data: str = Header(...)):
+    """Расчётные прогрессии больше не завершаются сами (см. _maybe_complete_or_topup) —
+    завершение теперь только явное действие пользователя."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        pid = get_active_profile_id(conn, uid)
+        _require_premium(conn, uid)
+        prog = _get_owned_progression(conn, pid, progression_id)
+        if prog["status"] != "active":
+            raise HTTPException(400, "Прогрессия уже не активна")
+        conn.execute("UPDATE progressions SET status='completed', updated_at=datetime('now') WHERE id=?", (progression_id,))
+    return {"ok": True}
 
 
 @app.get("/")

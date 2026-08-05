@@ -273,7 +273,8 @@ def init_db():
             # список повторов (пары "слабая,сильная" без анатомической привязки) раскладываем
             # по чётным/нечётным индексам на Л/П — точную историческую принадлежность стороне
             # восстановить нельзя (её и не сохраняли), поэтому это лучшее доступное приближение;
-            # дальше обе стороны продолжат считаться независимо от этой точки.
+            # дальше обе стороны продолжат считаться независимо от этой точки (если для этой
+            # прогрессии выбран режим "независимо" — см. unilateral_mode ниже).
             for row in conn.execute(
                 "SELECT id, current_weight, current_reps_detail, current_reps, fail_streak, "
                 "start_weight, start_reps, sets_count FROM progressions "
@@ -294,6 +295,17 @@ def init_db():
                     (cw, cw, json.dumps(rl), json.dumps(rr), row["fail_streak"], row["fail_streak"],
                      row["start_weight"], row["start_weight"], row["start_reps"], row["start_reps"], row["id"])
                 )
+
+        # Режим унилатеральной прогрессии: "independent" (стороны считаются полностью
+        # раздельно, могут разойтись по весу) или "equalize" (общий вес на обе стороны — как
+        # было до independent-режима, — подходит для бодибилдинга, где важна симметрия).
+        # Существующим unilateral-прогрессиям на момент добавления этой колонки ставим
+        # equalize — это ровно то, как они уже считались до сих пор, чтобы не менять их
+        # поведение задним числом; новые прогрессии выбирают режим явно при создании.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(progressions)").fetchall()]
+        if "unilateral_mode" not in cols:
+            conn.execute("ALTER TABLE progressions ADD COLUMN unilateral_mode TEXT")
+            conn.execute("UPDATE progressions SET unilateral_mode='equalize' WHERE unilateral=1 AND unilateral_mode IS NULL")
 
         migrate_legacy_data(conn)
 
@@ -548,6 +560,12 @@ def _unpack_uni_actual_side(actual_detail: list, side: str):
     return weight, reps
 
 
+def _uni_mode(prog) -> str:
+    """'equalize' (общий вес на обе стороны, как и до independent-режима — подходит для
+    бодибилдинга, где важна симметрия) или 'independent' (полностью раздельные треки)."""
+    return prog["unilateral_mode"] or "equalize"
+
+
 def _split_planned_uni_detail(planned_detail: list, side: str):
     """planned_detail сессии (список {weightL,repsL,weightR,repsR}) -> список повторов по
     одной стороне, для сверки "своей цели" в adapt_actual_detail."""
@@ -765,7 +783,9 @@ class ProgressionCreateIn(BaseModel):
     start_rir:      Optional[float] = None
     weeks:          Optional[int] = None       # длительность цикла в неделях (total_sessions = weeks*frequency)
     deload_enabled: bool = False
-    unilateral:     bool = False               # раздельный учёт по сторонам (см. _pack_unilateral_detail)
+    unilateral:     bool = False               # раздельный учёт по сторонам
+    unilateral_mode: str = "equalize"          # "equalize" (общий вес, подстройка слабой стороны под сильную)
+                                                # | "independent" (полностью раздельные треки веса и повторов)
     beginner_mode:  bool = False                # удвоенный шаг Step Up, выключается сам после первого не-UP
     amrap_every_weeks: Optional[int] = None     # раз в N недель heavy-сессия становится AMRAP-тестом; несовместимо с unilateral
     # manual:
@@ -1629,6 +1649,10 @@ def _serialize_progression(row) -> dict:
     d["beginner_mode"] = bool(d.get("beginner_mode"))
     if d.get("current_reps_detail"):
         d["current_reps_detail"] = json.loads(d["current_reps_detail"])
+    if d.get("current_reps_detailL"):
+        d["current_reps_detailL"] = json.loads(d["current_reps_detailL"])
+    if d.get("current_reps_detailR"):
+        d["current_reps_detailR"] = json.loads(d["current_reps_detailR"])
     return d
 
 
@@ -1668,7 +1692,25 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         return
     uni = bool(prog["unilateral"])
     new_total = prog["total_sessions"] + freq * TOPUP_EXTEND_WEEKS
-    if uni:
+    if not uni:
+        eff_sets = prog["sets_count"] or 1
+        detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
+        sessions = generate_remaining_sessions(
+            prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
+            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
+        )
+        _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
+                          frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
+    elif _uni_mode(prog) == "equalize":
+        eff_sets = (prog["sets_count"] or 1) * 2
+        detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
+        sessions = generate_remaining_sessions(
+            prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
+            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
+        )
+        _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
+                          frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
+    else:
         sets_count = prog["sets_count"] or 1
         rL = json.loads(prog["current_reps_detailL"]) if prog["current_reps_detailL"] else [prog["start_reps"] or 1] * sets_count
         rR = json.loads(prog["current_reps_detailR"]) if prog["current_reps_detailR"] else [prog["start_reps"] or 1] * sets_count
@@ -1678,15 +1720,6 @@ def _maybe_complete_or_topup(conn, progression_id: int):
             prog["current_weightL"], rL, prog["current_weightR"], rR
         )
         _insert_uni_sessions(conn, progression_id, sessions, frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
-    else:
-        eff_sets = prog["sets_count"] or 1
-        detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
-        sessions = generate_remaining_sessions(
-            prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
-        )
-        _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
-                          frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
     conn.execute("UPDATE progressions SET total_sessions=? WHERE id=?", (new_total, progression_id))
 
 
@@ -1810,20 +1843,25 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
 
         total_sessions = body.weeks * body.frequency
         start_reps_detail = [body.start_reps] * body.sets_count
+        uni_mode = body.unilateral_mode if body.unilateral_mode in ("equalize", "independent") else "equalize"
+        eff_sets_equalize = body.sets_count * 2  # только для equalize: общий вес, плоский список на обе стороны
+        start_reps_detail_equalize = [body.start_reps] * eff_sets_equalize
         try:
             cur = conn.execute(
                 "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
                 "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
                 "increment, start_weight, start_reps, start_rir, total_sessions, deload_enabled, unilateral, "
-                "beginner_mode, amrap_every_weeks, current_weight, current_reps, current_reps_detail, "
+                "unilateral_mode, beginner_mode, amrap_every_weeks, current_weight, current_reps, current_reps_detail, "
                 "current_weightL, current_weightR, current_reps_detailL, current_reps_detailR, "
                 "start_weightL, start_weightR, start_repsL, start_repsR) "
-                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, name, name_lc, body.exercise_type, body.goal, body.rep_unit,
                  body.rep_range_low, body.rep_range_high, body.frequency, body.sets_count,
                  body.increment, body.start_weight, body.start_reps, body.start_rir,
-                 total_sessions, int(body.deload_enabled), int(body.unilateral), int(body.beginner_mode),
-                 body.amrap_every_weeks, body.start_weight, body.start_reps, json.dumps(start_reps_detail),
+                 total_sessions, int(body.deload_enabled), int(body.unilateral),
+                 uni_mode if body.unilateral else None, int(body.beginner_mode),
+                 body.amrap_every_weeks, body.start_weight, body.start_reps,
+                 json.dumps(start_reps_detail_equalize if (body.unilateral and uni_mode == "equalize") else start_reps_detail),
                  body.start_weight, body.start_weight, json.dumps(start_reps_detail), json.dumps(start_reps_detail),
                  body.start_weight, body.start_weight, body.start_reps, body.start_reps)
             )
@@ -1831,7 +1869,24 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
         new_id = cur.lastrowid
 
-        if body.unilateral:
+        if not body.unilateral:
+            sessions = generate_remaining_sessions(
+                body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
+                body.increment, body.sets_count, total_sessions, 1, body.start_weight, start_reps_detail
+            )
+            _insert_sessions(conn, new_id, sessions, unilateral=False, display_sets_count=body.sets_count,
+                              frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
+        elif uni_mode == "equalize":
+            # Общий вес на обе стороны — раздельно считаются только повторы (см. _pack_unilateral_detail),
+            # слабая сторона подтягивается к сильной, а не наоборот; подходит для бодибилдинга,
+            # где важна симметрия, а не максимум силы каждой стороны по отдельности.
+            sessions = generate_remaining_sessions(
+                body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
+                body.increment, eff_sets_equalize, total_sessions, 1, body.start_weight, start_reps_detail_equalize
+            )
+            _insert_sessions(conn, new_id, sessions, unilateral=True, display_sets_count=body.sets_count,
+                              frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
+        else:
             # Обе стороны стартуют из одной точки (см. текст на экране создания), но дальше
             # каждая считается полностью независимо — свой вес, свои повторы.
             sessions = _generate_uni_sessions(
@@ -1841,13 +1896,6 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             )
             _insert_uni_sessions(conn, new_id, sessions, frequency=body.frequency,
                                   amrap_every_weeks=body.amrap_every_weeks)
-        else:
-            sessions = generate_remaining_sessions(
-                body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
-                body.increment, body.sets_count, total_sessions, 1, body.start_weight, start_reps_detail
-            )
-            _insert_sessions(conn, new_id, sessions, unilateral=False, display_sets_count=body.sets_count,
-                              frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
         return {"ok": True, "id": new_id}
 
 
@@ -1904,7 +1952,44 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
             conn.execute(
                 "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,)
             )
-            if prog["unilateral"]:
+            if not prog["unilateral"]:
+                cw = prog["current_weight"]
+                detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"] or low] * (prog["sets_count"] or 1)
+                cw, detail = normalize_range_detail(cw, detail, low, high, increment)
+                if len(detail) < sets_count:
+                    detail = detail + [detail[-1]] * (sets_count - len(detail))
+                elif len(detail) > sets_count:
+                    detail = detail[:sets_count]
+                conn.execute(
+                    "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=? WHERE id=?",
+                    (cw, detail[0], json.dumps(detail), progression_id)
+                )
+                sessions = generate_remaining_sessions(
+                    prog["exercise_type"], frequency, low, high, increment, sets_count,
+                    prog["total_sessions"], nxt, cw, detail
+                )
+                _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=sets_count,
+                                  frequency=frequency, amrap_every_weeks=amrap_weeks)
+            elif _uni_mode(prog) == "equalize":
+                eff_sets = sets_count * 2
+                cw = prog["current_weight"]
+                detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"] or low] * ((prog["sets_count"] or 1) * 2)
+                cw, detail = normalize_range_detail(cw, detail, low, high, increment)
+                if len(detail) < eff_sets:
+                    detail = detail + [detail[-1]] * (eff_sets - len(detail))
+                elif len(detail) > eff_sets:
+                    detail = detail[:eff_sets]
+                conn.execute(
+                    "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=? WHERE id=?",
+                    (cw, detail[0], json.dumps(detail), progression_id)
+                )
+                sessions = generate_remaining_sessions(
+                    prog["exercise_type"], frequency, low, high, increment, eff_sets,
+                    prog["total_sessions"], nxt, cw, detail
+                )
+                _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=sets_count,
+                                  frequency=frequency, amrap_every_weeks=amrap_weeks)
+            else:
                 rL = json.loads(prog["current_reps_detailL"]) if prog["current_reps_detailL"] else [low] * (prog["sets_count"] or 1)
                 rR = json.loads(prog["current_reps_detailR"]) if prog["current_reps_detailR"] else [low] * (prog["sets_count"] or 1)
                 cwL, rL = normalize_range_detail(prog["current_weightL"], rL, low, high, increment)
@@ -1923,24 +2008,6 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                     prog["total_sessions"], nxt, cwL, rL, cwR, rR
                 )
                 _insert_uni_sessions(conn, progression_id, sessions, frequency=frequency, amrap_every_weeks=amrap_weeks)
-            else:
-                cw = prog["current_weight"]
-                detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"] or low] * (prog["sets_count"] or 1)
-                cw, detail = normalize_range_detail(cw, detail, low, high, increment)
-                if len(detail) < sets_count:
-                    detail = detail + [detail[-1]] * (sets_count - len(detail))
-                elif len(detail) > sets_count:
-                    detail = detail[:sets_count]
-                conn.execute(
-                    "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=? WHERE id=?",
-                    (cw, detail[0], json.dumps(detail), progression_id)
-                )
-                sessions = generate_remaining_sessions(
-                    prog["exercise_type"], frequency, low, high, increment, sets_count,
-                    prog["total_sessions"], nxt, cw, detail
-                )
-                _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=sets_count,
-                                  frequency=frequency, amrap_every_weeks=amrap_weeks)
     return {"ok": True}
 
 
@@ -1996,7 +2063,7 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
 
         if prog["mode"] == "calculated" and session["role"] in (None, "heavy"):
             was_beginner = bool(prog["beginner_mode"])
-            if uni:
+            if uni and _uni_mode(prog) == "independent":
                 pd = json.loads(session["planned_detail"]) if session["planned_detail"] else None
                 sets_count = prog["sets_count"] or 1
                 if pd:
@@ -2056,6 +2123,55 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     )
                     _insert_uni_sessions(conn, progression_id, sessions, frequency=prog["frequency"],
                                           amrap_every_weeks=prog["amrap_every_weeks"])
+            elif uni:
+                # equalize: общий вес на обе стороны, раздельно считаются только повторы —
+                # см. _pack_unilateral_detail/_unpack_unilateral_actual. Слабая сторона
+                # подтягивается к сильной за счёт того, что решение по весу принимается по
+                # ВСЕМ 2*n подходам сразу (см. adapt_actual_detail) — вес не поднимется,
+                # пока обе стороны не доберутся до верха диапазона.
+                eff_sets = (prog["sets_count"] or 1) * 2
+                if session["planned_detail"]:
+                    pd = json.loads(session["planned_detail"])
+                    planned_reps_detail = [x for d in pd for x in (d["repsL"], d["repsR"])]
+                else:
+                    planned_reps_detail = [session["planned_reps"]] * eff_sets
+
+                if body.actual_detail:
+                    actual_records = [{"weight": s.weight, "reps": s.reps, "weightL": s.weightL,
+                                        "repsL": s.repsL, "weightR": s.weightR, "repsR": s.repsR}
+                                       for s in body.actual_detail]
+                    _, actual_detail = _unpack_unilateral_actual(actual_records)
+                else:
+                    # фолбэк без детализации по подходам — считаем обе стороны равными
+                    actual_detail = [{"weight": body.actual_weight, "reps": body.actual_reps}] * (body.actual_sets or 1)
+                    actual_detail = actual_detail * 2
+
+                new_w, new_r, new_fail, hold = adapt_actual_detail(
+                    session["planned_weight"], planned_reps_detail, actual_detail,
+                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
+                )
+                new_w, new_r = apply_progress_modifiers(
+                    new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
+                    body.actual_rir, was_beginner, hold
+                )
+                still_beginner = was_beginner and new_w > session["planned_weight"]
+                conn.execute(
+                    "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
+                    "fail_streak=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                    (new_w, new_r[0], json.dumps(new_r), new_fail, int(still_beginner), progression_id)
+                )
+                conn.execute(
+                    "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
+                    (progression_id, session["session_index"])
+                )
+                if session["session_index"] < prog["total_sessions"]:
+                    sessions = generate_remaining_sessions(
+                        prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                        prog["increment"], eff_sets, prog["total_sessions"],
+                        session["session_index"] + 1, new_w, new_r
+                    )
+                    _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
+                                      frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
             else:
                 eff_sets = prog["sets_count"]
                 if session["planned_detail"]:
@@ -2160,7 +2276,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
         if prog["mode"] == "calculated" and target["role"] in (None, "heavy"):
             # переигрываем историю до target, чтобы честно восстановить текущее состояние
             uni = bool(prog["unilateral"])
-            if uni:
+            if uni and _uni_mode(prog) == "independent":
                 sets_count = prog["sets_count"] or 1
                 wL, wR = prog["start_weightL"], prog["start_weightR"]
                 rL, rR = [prog["start_repsL"]] * sets_count, [prog["start_repsR"]] * sets_count
@@ -2224,6 +2340,54 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 _insert_uni_sessions(conn, progression_id, new_sessions, frequency=prog["frequency"],
                                       amrap_every_weeks=prog["amrap_every_weeks"])
+            elif uni:
+                # equalize: та же логика, что и раньше (до independent-режима) — общий вес,
+                # плоский список повторов вдвое длиннее (см. _pack_unilateral_detail/_unpack_unilateral_actual).
+                eff_sets = (prog["sets_count"] or 1) * 2
+                w = prog["start_weight"]
+                r = [prog["start_reps"]] * eff_sets
+                fail = 0
+                beginner = bool(prog["beginner_mode"])
+                for s in sessions:
+                    if s["session_index"] >= target["session_index"]:
+                        break
+                    if s["status"] == "done" and s["role"] in (None, "heavy"):
+                        if s["planned_detail"]:
+                            pd = json.loads(s["planned_detail"])
+                            planned_reps_detail = [x for d in pd for x in (d["repsL"], d["repsR"])]
+                        else:
+                            planned_reps_detail = [s["planned_reps"]] * eff_sets
+                        if s["actual_detail"]:
+                            stored = json.loads(s["actual_detail"])
+                            _, actual_detail = _unpack_unilateral_actual(stored)
+                        else:
+                            actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
+                            actual_detail = actual_detail * 2
+                        planned_w_at_the_time = s["planned_weight"]
+                        w, r, fail, hold = adapt_actual_detail(
+                            planned_w_at_the_time, planned_reps_detail, actual_detail,
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
+                        )
+                        w, r = apply_progress_modifiers(
+                            w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
+                            s["actual_rir"], beginner, hold
+                        )
+                        beginner = beginner and w > planned_w_at_the_time
+                conn.execute(
+                    "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
+                    "beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
+                    (w, r[0], json.dumps(r), fail, int(beginner), progression_id)
+                )
+                conn.execute(
+                    "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
+                    (progression_id, target["session_index"])
+                )
+                new_sessions = generate_remaining_sessions(
+                    prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r
+                )
+                _insert_sessions(conn, progression_id, new_sessions, unilateral=True, display_sets_count=prog["sets_count"],
+                                  frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
             else:
                 eff_sets = prog["sets_count"]
                 w = prog["start_weight"]
@@ -2300,40 +2464,9 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
         weeks       = body.weeks if body.weeks is not None else max(1, (prog["total_sessions"] or frequency) // (prog["frequency"] or 1))
         total_sessions = weeks * frequency
         uni = bool(prog["unilateral"])
+        uni_mode = _uni_mode(prog) if uni else None
 
-        if uni:
-            rL = json.loads(prog["current_reps_detailL"]) if prog["current_reps_detailL"] else [prog["start_repsL"] or 1] * (prog["sets_count"] or 1)
-            rR = json.loads(prog["current_reps_detailR"]) if prog["current_reps_detailR"] else [prog["start_repsR"] or 1] * (prog["sets_count"] or 1)
-            if len(rL) < sets_count: rL = rL + [rL[-1]] * (sets_count - len(rL))
-            elif len(rL) > sets_count: rL = rL[:sets_count]
-            if len(rR) < sets_count: rR = rR + [rR[-1]] * (sets_count - len(rR))
-            elif len(rR) > sets_count: rR = rR[:sets_count]
-            start_wL, start_wR = prog["current_weightL"], prog["current_weightR"]
-
-            try:
-                cur = conn.execute(
-                    "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
-                    "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
-                    "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, amrap_every_weeks, "
-                    "current_weight, current_reps, current_reps_detail, "
-                    "current_weightL, current_weightR, current_reps_detailL, current_reps_detailR, "
-                    "start_weightL, start_weightR, start_repsL, start_repsR) "
-                    "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
-                     low, high, frequency, sets_count, increment, start_wL, rL[0], total_sessions, int(deload),
-                     int(uni), prog["amrap_every_weeks"], start_wL, rL[0], json.dumps(rL),
-                     start_wL, start_wR, json.dumps(rL), json.dumps(rR),
-                     start_wL, start_wR, rL[0], rR[0])
-                )
-            except sqlite3.IntegrityError:
-                raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
-            new_id = cur.lastrowid
-            sessions = _generate_uni_sessions(
-                prog["exercise_type"], frequency, low, high, increment, sets_count, total_sessions, 1,
-                start_wL, rL, start_wR, rR
-            )
-            _insert_uni_sessions(conn, new_id, sessions, frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
-        else:
+        if not uni:
             eff_sets = sets_count
             start_w = prog["current_weight"]
             start_r_detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * (prog["sets_count"] or 1)
@@ -2348,7 +2481,7 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
                     "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
                     "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, amrap_every_weeks, "
                     "current_weight, current_reps, current_reps_detail) "
-                    "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
                      low, high, frequency, sets_count, increment, start_w, start_r_detail[0], total_sessions, int(deload),
                      int(uni), prog["amrap_every_weeks"], start_w, start_r_detail[0], json.dumps(start_r_detail))
@@ -2361,6 +2494,66 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
             )
             _insert_sessions(conn, new_id, sessions, unilateral=False, display_sets_count=sets_count,
                               frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
+        elif uni_mode == "equalize":
+            eff_sets = sets_count * 2
+            start_w = prog["current_weight"]
+            start_r_detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * ((prog["sets_count"] or 1) * 2)
+            if len(start_r_detail) < eff_sets:
+                start_r_detail = start_r_detail + [start_r_detail[-1]] * (eff_sets - len(start_r_detail))
+            elif len(start_r_detail) > eff_sets:
+                start_r_detail = start_r_detail[:eff_sets]
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
+                    "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
+                    "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, unilateral_mode, amrap_every_weeks, "
+                    "current_weight, current_reps, current_reps_detail) "
+                    "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
+                     low, high, frequency, sets_count, increment, start_w, start_r_detail[0], total_sessions, int(deload),
+                     int(uni), "equalize", prog["amrap_every_weeks"], start_w, start_r_detail[0], json.dumps(start_r_detail))
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
+            new_id = cur.lastrowid
+            sessions = generate_remaining_sessions(
+                prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail
+            )
+            _insert_sessions(conn, new_id, sessions, unilateral=True, display_sets_count=sets_count,
+                              frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
+        else:
+            rL = json.loads(prog["current_reps_detailL"]) if prog["current_reps_detailL"] else [prog["start_repsL"] or 1] * (prog["sets_count"] or 1)
+            rR = json.loads(prog["current_reps_detailR"]) if prog["current_reps_detailR"] else [prog["start_repsR"] or 1] * (prog["sets_count"] or 1)
+            if len(rL) < sets_count: rL = rL + [rL[-1]] * (sets_count - len(rL))
+            elif len(rL) > sets_count: rL = rL[:sets_count]
+            if len(rR) < sets_count: rR = rR + [rR[-1]] * (sets_count - len(rR))
+            elif len(rR) > sets_count: rR = rR[:sets_count]
+            start_wL, start_wR = prog["current_weightL"], prog["current_weightR"]
+
+            try:
+                cur = conn.execute(
+                    "INSERT INTO progressions (profile_id, exercise_name, exercise_name_lc, mode, status, "
+                    "exercise_type, goal, rep_unit, rep_range_low, rep_range_high, frequency, sets_count, "
+                    "increment, start_weight, start_reps, total_sessions, deload_enabled, unilateral, unilateral_mode, amrap_every_weeks, "
+                    "current_weight, current_reps, current_reps_detail, "
+                    "current_weightL, current_weightR, current_reps_detailL, current_reps_detailR, "
+                    "start_weightL, start_weightR, start_repsL, start_repsR) "
+                    "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, prog["exercise_name"], prog["exercise_name_lc"], prog["exercise_type"], goal, prog["rep_unit"],
+                     low, high, frequency, sets_count, increment, start_wL, rL[0], total_sessions, int(deload),
+                     int(uni), "independent", prog["amrap_every_weeks"], start_wL, rL[0], json.dumps(rL),
+                     start_wL, start_wR, json.dumps(rL), json.dumps(rR),
+                     start_wL, start_wR, rL[0], rR[0])
+                )
+            except sqlite3.IntegrityError:
+                raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
+            new_id = cur.lastrowid
+            sessions = _generate_uni_sessions(
+                prog["exercise_type"], frequency, low, high, increment, sets_count, total_sessions, 1,
+                start_wL, rL, start_wR, rR
+            )
+            _insert_uni_sessions(conn, new_id, sessions, frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
     return {"ok": True, "id": new_id}
 
 
@@ -2376,7 +2569,27 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
         if prog["mode"] != "calculated" or prog["status"] != "active":
             raise HTTPException(400, "Сбросить старт можно только для активной расчётной прогрессии")
         uni = bool(prog["unilateral"])
-        if uni:
+        if uni and _uni_mode(prog) == "equalize":
+            eff_sets = (prog["sets_count"] or 1) * 2
+            new_detail = [body.start_reps] * eff_sets
+            conn.execute(
+                "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=0, "
+                "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                (body.start_weight, body.start_reps, json.dumps(new_detail), int(body.beginner_mode), progression_id)
+            )
+            nxt = conn.execute(
+                "SELECT MIN(session_index) i FROM progression_sessions WHERE progression_id=? AND status='pending'",
+                (progression_id,)
+            ).fetchone()["i"]
+            if nxt is not None:
+                conn.execute("DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,))
+                sessions = generate_remaining_sessions(
+                    prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
+                    prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail
+                )
+                _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
+                                  frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
+        elif uni:
             sets_count = prog["sets_count"] or 1
             new_detail = [body.start_reps] * sets_count
             conn.execute(

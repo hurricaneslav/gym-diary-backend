@@ -1784,26 +1784,37 @@ def community_badge(x_init_data: str = Header(...)):
 def list_news(x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
     with get_db() as conn:
-        rows = conn.execute("SELECT * FROM news_posts ORDER BY id DESC").fetchall()
+        # Сортировка по дате поста (created_at), а не по id — так админ может
+        # проставить архивный пост задним числом, и он встанет на своё место
+        # в хронологии, а не выпрыгнет наверх только из-за большего id.
+        rows = conn.execute("SELECT * FROM news_posts ORDER BY created_at DESC, id DESC").fetchall()
         posts = [{"id": r["id"], "title": r["title"], "body": r["body"], "created_at": r["created_at"]} for r in rows]
         if posts:
+            # "Прочитано" отмечается по максимальному id среди всех постов (а не
+            # по первому в списке) — иначе архивный пост с датой в прошлом,
+            # добавленный позже остальных, не попал бы в отметку прочитанного.
+            max_id = max(p["id"] for p in posts)
             conn.execute(
                 "INSERT INTO news_reads (user_id, last_read_post_id) VALUES (?,?) "
                 "ON CONFLICT(user_id) DO UPDATE SET last_read_post_id=MAX(last_read_post_id, excluded.last_read_post_id)",
-                (uid, posts[0]["id"])
+                (uid, max_id)
             )
     return posts
 
 
-def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile) -> list:
-    """Собирает посты ленты (тренировки+замеры) для одного профиля друга,
-    уважая его тумблеры видимости — так же, как get_friend_profile."""
+def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self: bool = False) -> list:
+    """Собирает посты ленты (тренировки+замеры) для одного профиля. Для
+    друзей уважает его тумблеры видимости (show_workouts/show_exercises/
+    show_comments/show_measurements) — так же, как get_friend_profile. Для
+    собственного профиля (is_self=True) тумблеры игнорируются: они управляют
+    тем, что видят другие, а не тем, что видит сам пользователь — свои посты
+    в своей же ленте должны быть видны полностью независимо от этих настроек."""
     if not profile:
         return []
-    show_w = bool(profile["show_workouts"])
-    show_e = bool(profile["show_exercises"])
-    show_c = bool(profile["show_comments"])
-    show_m = bool(profile["show_measurements"])
+    show_w = is_self or bool(profile["show_workouts"])
+    show_e = is_self or bool(profile["show_exercises"])
+    show_c = is_self or bool(profile["show_comments"])
+    show_m = is_self or bool(profile["show_measurements"])
     author = _user_display(conn, owner_id)
     posts = []
 
@@ -1833,8 +1844,8 @@ def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile) -> list:
 @app.get("/community/feed")
 def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(...)):
     """
-    Единая лента постов (тренировки+замеры) всех друзей, отсортированная по
-    дате/id — новые сверху. Пагинация курсором sort_key (передать sort_key
+    Единая лента постов (тренировки+замеры) — свои и всех друзей, отсортированная
+    по дате/id — новые сверху. Пагинация курсором sort_key (передать sort_key
     последнего полученного поста как `before`, чтобы получить следующую
     страницу). Собирается в Python: у большинства пользователей друзей мало,
     держать это одним SQL-джойном не даёт выигрыша и усложняет учёт тумблеров
@@ -1847,6 +1858,10 @@ def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(
         friend_ids = [r["user_b"] if r["user_a"] == uid else r["user_a"] for r in rows]
 
         all_posts = []
+        # Свои посты тоже входят в ленту — иначе не увидеть лайки/комментарии
+        # к собственным тренировкам и замерам от друзей.
+        my_profile = conn.execute("SELECT * FROM profiles WHERE owner_id=? AND is_main=1", (uid,)).fetchone()
+        all_posts.extend(_feed_posts_for_owner(conn, uid, uid, my_profile, is_self=True))
         for fid in friend_ids:
             profile = conn.execute("SELECT * FROM profiles WHERE owner_id=? AND is_main=1", (fid,)).fetchone()
             all_posts.extend(_feed_posts_for_owner(conn, fid, uid, profile))
@@ -3160,7 +3175,7 @@ async def admin_premium_bulk(request: Request, _: bool = Depends(verify_admin)):
 @app.get("/admin/news", response_class=HTMLResponse, include_in_schema=False)
 def admin_news_page(_: bool = Depends(verify_admin)):
     with get_db() as conn:
-        posts = conn.execute("SELECT * FROM news_posts ORDER BY id DESC").fetchall()
+        posts = conn.execute("SELECT * FROM news_posts ORDER BY created_at DESC, id DESC").fetchall()
 
     rows_html = ""
     for p in posts:
@@ -3169,18 +3184,25 @@ def admin_news_page(_: bool = Depends(verify_admin)):
             f'<div style="font-weight:600;margin-bottom:6px">{html.escape(p["title"])}</div>'
             f'<div style="color:#AAA;font-size:13px;white-space:pre-wrap;margin-bottom:8px">{html.escape(p["body"])}</div>'
             f'<div style="color:#555;font-size:12px;margin-bottom:10px">{html.escape(p["created_at"])}</div>'
+            '<div style="display:flex;gap:8px">'
+            f'<a href="/admin/news/{p["id"]}/edit"><button class="btn ghost" type="button">Редактировать</button></a>'
             '<form method="post" action="/admin/news/delete" onsubmit="return confirm(\'Удалить пост?\')">'
             f'<input type="hidden" name="id" value="{p["id"]}">'
             '<button class="btn danger" type="submit">Удалить</button></form>'
             '</div>'
+            '</div>'
         )
 
+    # По умолчанию — текущий момент, в формате datetime-local (YYYY-MM-DDTHH:MM).
+    now_local = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
     body = (
         '<div class="card">'
         '<form method="post" action="/admin/news">'
         '<div class="field"><label>Заголовок</label><input name="title" required></div>'
         '<div class="field"><label>Текст (поддерживается простой markdown: **жирный**, *курсив*, переносы строк)</label>'
         '<textarea name="body" rows="6" required></textarea></div>'
+        f'<div class="field"><label>Дата публикации</label><input type="datetime-local" name="published_at" value="{now_local}" required>'
+        '<div style="color:#555;font-size:12px;margin-top:4px">Можно поставить дату в прошлом, чтобы опубликовать пост архивом — он встанет на своё место по хронологии.</div></div>'
         '<button class="btn" type="submit">Опубликовать</button>'
         '</form></div>'
         '<h2>Опубликованные посты</h2>'
@@ -3189,14 +3211,65 @@ def admin_news_page(_: bool = Depends(verify_admin)):
     return admin_page("Новости и обновления", body)
 
 
+@app.get("/admin/news/{post_id}/edit", response_class=HTMLResponse, include_in_schema=False)
+def admin_news_edit_page(post_id: int, _: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        p = conn.execute("SELECT * FROM news_posts WHERE id=?", (post_id,)).fetchone()
+    if not p:
+        raise HTTPException(404, "Пост не найден")
+
+    # created_at хранится как "YYYY-MM-DD HH:MM:SS" — datetime-local хочет "YYYY-MM-DDTHH:MM".
+    try:
+        dt_value = p["created_at"].replace(" ", "T")[:16]
+    except Exception:
+        dt_value = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M")
+
+    body = (
+        '<div class="card">'
+        f'<form method="post" action="/admin/news/{p["id"]}/edit">'
+        f'<div class="field"><label>Заголовок</label><input name="title" value="{html.escape(p["title"])}" required></div>'
+        '<div class="field"><label>Текст (поддерживается простой markdown: **жирный**, *курсив*, переносы строк)</label>'
+        f'<textarea name="body" rows="6" required>{html.escape(p["body"])}</textarea></div>'
+        f'<div class="field"><label>Дата публикации</label><input type="datetime-local" name="published_at" value="{dt_value}" required></div>'
+        '<button class="btn" type="submit">Сохранить</button>'
+        '</form></div>'
+        '<a href="/admin/news"><button class="btn ghost" type="button">Назад к списку</button></a>'
+    )
+    return admin_page("Редактирование новости", body)
+
+
 @app.post("/admin/news", response_class=HTMLResponse, include_in_schema=False)
 async def admin_news_create(request: Request, _: bool = Depends(verify_admin)):
     form = await request.form()
     title = (form.get("title") or "").strip()
     text = (form.get("body") or "").strip()
+    published_at = (form.get("published_at") or "").strip()
     if title and text:
+        # datetime-local отдаёт "YYYY-MM-DDTHH:MM" — приводим к тому же формату,
+        # что и datetime('now') в SQLite ("YYYY-MM-DD HH:MM:SS"), чтобы сортировка
+        # строкой (ORDER BY created_at) работала корректно вперемешку со старыми записями.
+        created_at = published_at.replace("T", " ") + ":00" if published_at else None
         with get_db() as conn:
-            conn.execute("INSERT INTO news_posts (title, body) VALUES (?,?)", (title, text))
+            if created_at:
+                conn.execute("INSERT INTO news_posts (title, body, created_at) VALUES (?,?,?)", (title, text, created_at))
+            else:
+                conn.execute("INSERT INTO news_posts (title, body) VALUES (?,?)", (title, text))
+    return RedirectResponse("/admin/news", status_code=303)
+
+
+@app.post("/admin/news/{post_id}/edit", response_class=HTMLResponse, include_in_schema=False)
+async def admin_news_update(post_id: int, request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    title = (form.get("title") or "").strip()
+    text = (form.get("body") or "").strip()
+    published_at = (form.get("published_at") or "").strip()
+    if title and text and published_at:
+        created_at = published_at.replace("T", " ") + ":00"
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE news_posts SET title=?, body=?, created_at=? WHERE id=?",
+                (title, text, created_at, post_id)
+            )
     return RedirectResponse("/admin/news", status_code=303)
 
 

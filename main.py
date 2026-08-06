@@ -155,6 +155,41 @@ def init_db():
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (user_a, user_b)
             );
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_user_id TEXT NOT NULL,
+                to_user_id   TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                responded_at TEXT,
+                UNIQUE(from_user_id, to_user_id)
+            );
+            CREATE TABLE IF NOT EXISTS news_posts (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS news_reads (
+                user_id       TEXT NOT NULL,
+                last_read_post_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id)
+            );
+            CREATE TABLE IF NOT EXISTS post_likes (
+                post_type  TEXT NOT NULL,
+                post_id    INTEGER NOT NULL,
+                user_id    TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (post_type, post_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS post_comments (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_type  TEXT NOT NULL,
+                post_id    INTEGER NOT NULL,
+                user_id    TEXT NOT NULL,
+                text       TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             CREATE TABLE IF NOT EXISTS exercise_notes (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 profile_id INTEGER NOT NULL,
@@ -746,6 +781,16 @@ class FriendUsernameIn(BaseModel):
 
 class FriendCodeIn(BaseModel):
     code: str
+
+class FriendRequestActionIn(BaseModel):
+    request_id: int
+
+class NewsPostIn(BaseModel):
+    title: str
+    body: str
+
+class CommentIn(BaseModel):
+    text: str
 
 class ExerciseNoteIn(BaseModel):
     name: str
@@ -1516,6 +1561,42 @@ def search_users(q: str = "", x_init_data: str = Header(...)):
     return [{"id": r["user_id"], "username": r["username"], "name": r["first_name"] or r["username"]} for r in rows]
 
 
+def _create_friend_request(conn, uid: str, tid: str):
+    """
+    Создаёт заявку в друзья uid → tid, либо — если tid уже отправил такую же
+    заявку uid раньше (оба искали друг друга одновременно) — сразу принимает
+    её и добавляет в friends, без дублирования запроса в обе стороны.
+    Ничего не делает, если уже друзья или заявка уже висит в любую сторону.
+    """
+    a, b = normalize_pair(uid, tid)
+    already = conn.execute("SELECT 1 FROM friends WHERE user_a=? AND user_b=?", (a, b)).fetchone()
+    if already:
+        return {"status": "already_friends"}
+
+    reverse = conn.execute(
+        "SELECT id FROM friend_requests WHERE from_user_id=? AND to_user_id=? AND status='pending'",
+        (tid, uid)
+    ).fetchone()
+    if reverse:
+        conn.execute("UPDATE friend_requests SET status='accepted', responded_at=datetime('now') WHERE id=?", (reverse["id"],))
+        conn.execute("INSERT OR IGNORE INTO friends (user_a, user_b) VALUES (?,?)", (a, b))
+        return {"status": "accepted"}
+
+    existing = conn.execute(
+        "SELECT id, status FROM friend_requests WHERE from_user_id=? AND to_user_id=?", (uid, tid)
+    ).fetchone()
+    if existing and existing["status"] == "pending":
+        return {"status": "already_pending"}
+    if existing:
+        conn.execute(
+            "UPDATE friend_requests SET status='pending', created_at=datetime('now'), responded_at=NULL WHERE id=?",
+            (existing["id"],)
+        )
+    else:
+        conn.execute("INSERT INTO friend_requests (from_user_id, to_user_id) VALUES (?,?)", (uid, tid))
+    return {"status": "pending"}
+
+
 @app.post("/friends/add-by-username")
 def add_friend_by_username(body: FriendUsernameIn, x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
@@ -1527,9 +1608,8 @@ def add_friend_by_username(body: FriendUsernameIn, x_init_data: str = Header(...
         tid = target["user_id"]
         if tid == uid:
             raise HTTPException(400, "Нельзя добавить себя")
-        a, b = normalize_pair(uid, tid)
-        conn.execute("INSERT OR IGNORE INTO friends (user_a, user_b) VALUES (?,?)", (a, b))
-    return {"ok": True}
+        result = _create_friend_request(conn, uid, tid)
+    return result
 
 
 @app.post("/friends/add-by-code")
@@ -1541,9 +1621,61 @@ def add_friend_by_code(body: FriendCodeIn, x_init_data: str = Header(...)):
             raise HTTPException(404, "Ссылка недействительна")
         tid = target["user_id"]
         if tid == uid:
-            return {"ok": True}
-        a, b = normalize_pair(uid, tid)
+            return {"status": "already_friends"}
+        result = _create_friend_request(conn, uid, tid)
+    return result
+
+
+@app.get("/friends/requests")
+def list_friend_requests(x_init_data: str = Header(...)):
+    """Входящие заявки (ожидающие решения этого пользователя)."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT fr.id, fr.from_user_id, fr.created_at, u.username, u.first_name "
+            "FROM friend_requests fr JOIN users u ON u.user_id = fr.from_user_id "
+            "WHERE fr.to_user_id=? AND fr.status='pending' ORDER BY fr.created_at DESC",
+            (uid,)
+        ).fetchall()
+    return [
+        {
+            "request_id": r["id"],
+            "id": r["from_user_id"],
+            "username": r["username"],
+            "name": r["first_name"] or r["username"] or "Без имени",
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+@app.post("/friends/requests/accept")
+def accept_friend_request(body: FriendRequestActionIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        req = conn.execute(
+            "SELECT * FROM friend_requests WHERE id=? AND to_user_id=? AND status='pending'",
+            (body.request_id, uid)
+        ).fetchone()
+        if not req:
+            raise HTTPException(404, "Заявка не найдена")
+        conn.execute("UPDATE friend_requests SET status='accepted', responded_at=datetime('now') WHERE id=?", (req["id"],))
+        a, b = normalize_pair(uid, req["from_user_id"])
         conn.execute("INSERT OR IGNORE INTO friends (user_a, user_b) VALUES (?,?)", (a, b))
+    return {"ok": True}
+
+
+@app.post("/friends/requests/decline")
+def decline_friend_request(body: FriendRequestActionIn, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        req = conn.execute(
+            "SELECT id FROM friend_requests WHERE id=? AND to_user_id=? AND status='pending'",
+            (body.request_id, uid)
+        ).fetchone()
+        if not req:
+            raise HTTPException(404, "Заявка не найдена")
+        conn.execute("UPDATE friend_requests SET status='declined', responded_at=datetime('now') WHERE id=?", (req["id"],))
     return {"ok": True}
 
 
@@ -1619,6 +1751,182 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
         "workouts": workouts,
         "measurements": measurements,
     }
+
+
+# ── Роуты: сообщество (новости, бейдж, лента, лайки/комментарии) ───────────────
+
+def _user_display(conn, uid: str) -> dict:
+    u = conn.execute("SELECT username, first_name FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not u:
+        return {"id": uid, "username": None, "name": "Пользователь"}
+    return {"id": uid, "username": u["username"], "name": u["first_name"] or u["username"] or "Без имени"}
+
+
+@app.get("/community/badge")
+def community_badge(x_init_data: str = Header(...)):
+    """Есть ли что-то новое во вкладке «Сообщество» — непрочитанные новости
+    и/или неотвеченные заявки в друзья. Лёгкий запрос, дёргается чаще остальных."""
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        last_post = conn.execute("SELECT MAX(id) m FROM news_posts").fetchone()["m"] or 0
+        read_row = conn.execute("SELECT last_read_post_id FROM news_reads WHERE user_id=?", (uid,)).fetchone()
+        last_read = read_row["last_read_post_id"] if read_row else 0
+        pending_requests = conn.execute(
+            "SELECT COUNT(*) c FROM friend_requests WHERE to_user_id=? AND status='pending'", (uid,)
+        ).fetchone()["c"]
+    return {
+        "unread_news": last_post > last_read,
+        "pending_requests": pending_requests,
+    }
+
+
+@app.get("/news")
+def list_news(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM news_posts ORDER BY id DESC").fetchall()
+        posts = [{"id": r["id"], "title": r["title"], "body": r["body"], "created_at": r["created_at"]} for r in rows]
+        if posts:
+            conn.execute(
+                "INSERT INTO news_reads (user_id, last_read_post_id) VALUES (?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET last_read_post_id=MAX(last_read_post_id, excluded.last_read_post_id)",
+                (uid, posts[0]["id"])
+            )
+    return posts
+
+
+def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile) -> list:
+    """Собирает посты ленты (тренировки+замеры) для одного профиля друга,
+    уважая его тумблеры видимости — так же, как get_friend_profile."""
+    if not profile:
+        return []
+    show_w = bool(profile["show_workouts"])
+    show_e = bool(profile["show_exercises"])
+    show_c = bool(profile["show_comments"])
+    show_m = bool(profile["show_measurements"])
+    author = _user_display(conn, owner_id)
+    posts = []
+
+    if show_w:
+        rows = conn.execute("SELECT * FROM workouts WHERE profile_id=? ORDER BY id DESC", (profile["id"],)).fetchall()
+        for r in rows:
+            exs = json.loads(r["exercises"]) if show_e else []
+            if not show_c:
+                for ex in exs:
+                    ex["comment"] = ""
+            posts.append({
+                "post_type": "workout", "post_id": r["id"],
+                "date": r["date"], "sort_key": f"{r['date']}T{r['id']:08d}",
+                "author": author, "title": r["name"], "exercises": exs,
+            })
+
+    if show_m:
+        rows = conn.execute("SELECT * FROM measurements WHERE profile_id=? ORDER BY id DESC", (profile["id"],)).fetchall()
+        for r in rows:
+            item = {"post_type": "measurement", "post_id": r["id"], "date": r["date"], "sort_key": f"{r['date']}T{r['id']:08d}", "author": author, "title": r["name"]}
+            item.update(json.loads(r["data"]))
+            posts.append(item)
+
+    return posts
+
+
+@app.get("/community/feed")
+def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(...)):
+    """
+    Единая лента постов (тренировки+замеры) всех друзей, отсортированная по
+    дате/id — новые сверху. Пагинация курсором sort_key (передать sort_key
+    последнего полученного поста как `before`, чтобы получить следующую
+    страницу). Собирается в Python: у большинства пользователей друзей мало,
+    держать это одним SQL-джойном не даёт выигрыша и усложняет учёт тумблеров
+    видимости (show_workouts/show_exercises/show_comments/show_measurements),
+    которые уже читаются построчно в get_friend_profile — переиспользуем ту же логику.
+    """
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        rows = conn.execute("SELECT user_a, user_b FROM friends WHERE user_a=? OR user_b=?", (uid, uid)).fetchall()
+        friend_ids = [r["user_b"] if r["user_a"] == uid else r["user_a"] for r in rows]
+
+        all_posts = []
+        for fid in friend_ids:
+            profile = conn.execute("SELECT * FROM profiles WHERE owner_id=? AND is_main=1", (fid,)).fetchone()
+            all_posts.extend(_feed_posts_for_owner(conn, fid, uid, profile))
+
+        all_posts.sort(key=lambda p: p["sort_key"], reverse=True)
+        if before:
+            all_posts = [p for p in all_posts if p["sort_key"] < before]
+        page = all_posts[:limit]
+
+        for p in page:
+            likes = conn.execute(
+                "SELECT user_id FROM post_likes WHERE post_type=? AND post_id=?", (p["post_type"], p["post_id"])
+            ).fetchall()
+            p["like_count"] = len(likes)
+            p["liked_by_me"] = any(l["user_id"] == uid for l in likes)
+            comments = conn.execute(
+                "SELECT id, user_id, text, created_at FROM post_comments WHERE post_type=? AND post_id=? ORDER BY id",
+                (p["post_type"], p["post_id"])
+            ).fetchall()
+            p["comments"] = [
+                {"id": c["id"], "author": _user_display(conn, c["user_id"]), "text": c["text"], "created_at": c["created_at"]}
+                for c in comments
+            ]
+
+    return {
+        "posts": page,
+        "next_before": page[-1]["sort_key"] if len(page) == limit else None,
+    }
+
+
+@app.post("/community/{post_type}/{post_id}/like")
+def toggle_like(post_type: str, post_id: int, x_init_data: str = Header(...)):
+    if post_type not in ("workout", "measurement"):
+        raise HTTPException(400, "Неверный тип поста")
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM post_likes WHERE post_type=? AND post_id=? AND user_id=?", (post_type, post_id, uid)
+        ).fetchone()
+        if existing:
+            conn.execute("DELETE FROM post_likes WHERE post_type=? AND post_id=? AND user_id=?", (post_type, post_id, uid))
+            liked = False
+        else:
+            conn.execute("INSERT INTO post_likes (post_type, post_id, user_id) VALUES (?,?,?)", (post_type, post_id, uid))
+            liked = True
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM post_likes WHERE post_type=? AND post_id=?", (post_type, post_id)
+        ).fetchone()["c"]
+    return {"liked_by_me": liked, "like_count": count}
+
+
+@app.post("/community/{post_type}/{post_id}/comments")
+def add_comment(post_type: str, post_id: int, body: CommentIn, x_init_data: str = Header(...)):
+    if post_type not in ("workout", "measurement"):
+        raise HTTPException(400, "Неверный тип поста")
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "Пустой комментарий")
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        cur = conn.execute(
+            "INSERT INTO post_comments (post_type, post_id, user_id, text) VALUES (?,?,?,?)",
+            (post_type, post_id, uid, text)
+        )
+        row = conn.execute("SELECT created_at FROM post_comments WHERE id=?", (cur.lastrowid,)).fetchone()
+        author = _user_display(conn, uid)
+    return {"id": cur.lastrowid, "author": author, "text": text, "created_at": row["created_at"]}
+
+
+@app.delete("/community/comments/{comment_id}")
+def delete_comment(comment_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        row = conn.execute("SELECT user_id FROM post_comments WHERE id=?", (comment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Комментарий не найден")
+        if row["user_id"] != uid:
+            raise HTTPException(403, "Можно удалить только свой комментарий")
+        conn.execute("DELETE FROM post_comments WHERE id=?", (comment_id,))
+    return {"ok": True}
 
 
 # ── Роуты: прогрессия ────────────────────────────────────────────────────────
@@ -2746,6 +3054,7 @@ def admin_page(title: str, body: str) -> HTMLResponse:
         '<div class="nav">'
         '<a href="/admin">Дашборд</a>'
         '<a href="/admin/premium">Премиум</a>'
+        '<a href="/admin/news">Новости</a>'
         '<a href="/admin/sql">SQL-запрос</a>'
         '<a href="/admin/db/download">Скачать базу</a>'
         '<a href="/admin/db/upload">Загрузить базу</a>'
@@ -2846,6 +3155,59 @@ async def admin_premium_bulk(request: Request, _: bool = Depends(verify_admin)):
         elif action == "disable_all":
             conn.execute("UPDATE users SET is_premium=0")
     return RedirectResponse("/admin/premium", status_code=303)
+
+
+@app.get("/admin/news", response_class=HTMLResponse, include_in_schema=False)
+def admin_news_page(_: bool = Depends(verify_admin)):
+    with get_db() as conn:
+        posts = conn.execute("SELECT * FROM news_posts ORDER BY id DESC").fetchall()
+
+    rows_html = ""
+    for p in posts:
+        rows_html += (
+            '<div class="card">'
+            f'<div style="font-weight:600;margin-bottom:6px">{html.escape(p["title"])}</div>'
+            f'<div style="color:#AAA;font-size:13px;white-space:pre-wrap;margin-bottom:8px">{html.escape(p["body"])}</div>'
+            f'<div style="color:#555;font-size:12px;margin-bottom:10px">{html.escape(p["created_at"])}</div>'
+            '<form method="post" action="/admin/news/delete" onsubmit="return confirm(\'Удалить пост?\')">'
+            f'<input type="hidden" name="id" value="{p["id"]}">'
+            '<button class="btn danger" type="submit">Удалить</button></form>'
+            '</div>'
+        )
+
+    body = (
+        '<div class="card">'
+        '<form method="post" action="/admin/news">'
+        '<div class="field"><label>Заголовок</label><input name="title" required></div>'
+        '<div class="field"><label>Текст (поддерживается простой markdown: **жирный**, *курсив*, переносы строк)</label>'
+        '<textarea name="body" rows="6" required></textarea></div>'
+        '<button class="btn" type="submit">Опубликовать</button>'
+        '</form></div>'
+        '<h2>Опубликованные посты</h2>'
+        f'{rows_html or "<p style=\'color:#555\'>Пока нет постов</p>"}'
+    )
+    return admin_page("Новости и обновления", body)
+
+
+@app.post("/admin/news", response_class=HTMLResponse, include_in_schema=False)
+async def admin_news_create(request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    title = (form.get("title") or "").strip()
+    text = (form.get("body") or "").strip()
+    if title and text:
+        with get_db() as conn:
+            conn.execute("INSERT INTO news_posts (title, body) VALUES (?,?)", (title, text))
+    return RedirectResponse("/admin/news", status_code=303)
+
+
+@app.post("/admin/news/delete", response_class=HTMLResponse, include_in_schema=False)
+async def admin_news_delete(request: Request, _: bool = Depends(verify_admin)):
+    form = await request.form()
+    post_id = form.get("id")
+    if post_id:
+        with get_db() as conn:
+            conn.execute("DELETE FROM news_posts WHERE id=?", (post_id,))
+    return RedirectResponse("/admin/news", status_code=303)
 
 
 @app.get("/admin/table/{table}", response_class=HTMLResponse, include_in_schema=False)

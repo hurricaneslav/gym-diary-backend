@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, Plai
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, os, secrets, shutil, time, html, datetime, io
+import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, os, secrets, shutil, time, html, html.parser, datetime, io, re
 
 app = FastAPI()
 
@@ -1755,6 +1755,69 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
 
 # ── Роуты: сообщество (новости, бейдж, лента, лайки/комментарии) ───────────────
 
+# Разрешённый набор тегов для rich-текста новостей (жирный/курсив/подчёркнутый,
+# списки, переносы строк/абзацы) — ровно то, что даёт панель форматирования в
+# админке и что обычно прилетает при вставке скопированного форматированного
+# текста (Telegram, Google Docs, Word и т.п.). Всё остальное (script, style,
+# классы, инлайн-стили, атрибуты) вырезается, чтобы вставленный извне HTML не
+# мог принести с собой постороннюю разметку или код.
+_ALLOWED_NEWS_TAGS = {"b", "strong", "i", "em", "u", "ul", "ol", "li", "br", "div", "p"}
+
+
+class _NewsHTMLSanitizer(html.parser.HTMLParser):
+    """Оставляет только теги из _ALLOWED_NEWS_TAGS, без единого атрибута;
+    весь текст экранируется заново — на выходе безопасный HTML-фрагмент,
+    который можно вставлять в страницу через dangerouslySetInnerHTML.
+    Содержимое <script>/<style> отбрасывается целиком, а не просто
+    рассекречивается как обычный текст."""
+
+    _SKIP_CONTENT_TAGS = {"script", "style"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP_CONTENT_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in _ALLOWED_NEWS_TAGS:
+            self.out.append(f"<{tag}>")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP_CONTENT_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+            return
+        if self._skip_depth:
+            return
+        if tag in _ALLOWED_NEWS_TAGS:
+            self.out.append(f"</{tag}>")
+
+    def handle_startendtag(self, tag, attrs):
+        if self._skip_depth:
+            return
+        if tag == "br":
+            self.out.append("<br>")
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        self.out.append(html.escape(data))
+
+    def get_html(self) -> str:
+        return "".join(self.out)
+
+
+def sanitize_news_html(raw: str) -> str:
+    parser = _NewsHTMLSanitizer()
+    parser.feed(raw or "")
+    parser.close()
+    return parser.get_html()
+
+
 def _user_display(conn, uid: str) -> dict:
     u = conn.execute("SELECT username, first_name FROM users WHERE user_id=?", (uid,)).fetchone()
     if not u:
@@ -3060,6 +3123,14 @@ label{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase
 .pager{display:flex;gap:10px;align-items:center;margin-bottom:16px;font-size:13px;color:#888}
 .actions{display:flex;gap:6px}
 .actions form{display:inline}
+.rte-toolbar{display:flex;gap:6px;margin-bottom:6px}
+.rte-btn{padding:6px 10px;border:1px solid #2A2A2A;background:#111;color:#CCC;font-size:12px;cursor:pointer;font-family:inherit}
+.rte-btn:hover{border-color:#666;color:#FFF}
+.rte-editor{min-height:120px;background:#111;border:1px solid #2A2A2A;color:#FFF;font-size:13px;padding:9px 10px;margin-bottom:10px;line-height:1.5}
+.rte-editor:focus{outline:none;border-color:#666}
+.rte-editor ul,.rte-editor ol{padding-left:22px;margin:6px 0}
+.news-preview{color:#AAA;font-size:13px;line-height:1.5}
+.news-preview ul,.news-preview ol{padding-left:20px;margin:4px 0}
 </style>
 """
 
@@ -3172,6 +3243,47 @@ async def admin_premium_bulk(request: Request, _: bool = Depends(verify_admin)):
     return RedirectResponse("/admin/premium", status_code=303)
 
 
+def _rich_text_editor_html(field_id: str, initial_html: str = "") -> str:
+    """
+    Панель форматирования (Жирный/Курсив/Подчёркнутый/Список) + редактируемая
+    область поверх обычного document.execCommand — простое, без сторонних
+    библиотек, решение, которого достаточно для новостных постов. Вставка
+    скопированного форматированного текста (жирный из Telegram/Word/Google
+    Docs и т.п.) сохраняет форматирование, потому что contenteditable честно
+    принимает HTML из буфера обмена — в отличие от обычной <textarea>, которая
+    всегда превращает вставку в голый текст.
+    Итоговый HTML редактора уходит в скрытое поле {field_id} прямо перед
+    отправкой формы (submit-обработчик ниже) — сервер получает готовый HTML,
+    а не markdown, и прогоняет его через sanitize_news_html перед записью в БД.
+    """
+    return f'''
+<div class="rte-toolbar">
+  <button type="button" class="rte-btn" data-cmd="bold"><b>Ж</b></button>
+  <button type="button" class="rte-btn" data-cmd="italic"><i>К</i></button>
+  <button type="button" class="rte-btn" data-cmd="underline"><u>Ч</u></button>
+  <button type="button" class="rte-btn" data-cmd="insertUnorderedList">• Список</button>
+</div>
+<div id="{field_id}_editor" class="rte-editor" contenteditable="true">{initial_html}</div>
+<input type="hidden" name="body" id="{field_id}">
+<script>
+(function(){{
+  var editor = document.getElementById("{field_id}_editor");
+  var hidden = document.getElementById("{field_id}");
+  var toolbar = editor.previousElementSibling;
+  toolbar.querySelectorAll(".rte-btn").forEach(function(btn){{
+    btn.addEventListener("click", function(){{
+      editor.focus();
+      document.execCommand(btn.dataset.cmd, false, null);
+    }});
+  }});
+  editor.closest("form").addEventListener("submit", function(){{
+    hidden.value = editor.innerHTML;
+  }});
+}})();
+</script>
+'''
+
+
 @app.get("/admin/news", response_class=HTMLResponse, include_in_schema=False)
 def admin_news_page(_: bool = Depends(verify_admin)):
     with get_db() as conn:
@@ -3182,8 +3294,8 @@ def admin_news_page(_: bool = Depends(verify_admin)):
         rows_html += (
             '<div class="card">'
             f'<div style="font-weight:600;margin-bottom:6px">{html.escape(p["title"])}</div>'
-            f'<div style="color:#AAA;font-size:13px;white-space:pre-wrap;margin-bottom:8px">{html.escape(p["body"])}</div>'
-            f'<div style="color:#555;font-size:12px;margin-bottom:10px">{html.escape(p["created_at"])}</div>'
+            f'<div class="news-preview">{p["body"]}</div>'
+            f'<div style="color:#555;font-size:12px;margin:8px 0 10px">{html.escape(p["created_at"])}</div>'
             '<div style="display:flex;gap:8px">'
             f'<a href="/admin/news/{p["id"]}/edit"><button class="btn ghost" type="button">Редактировать</button></a>'
             '<form method="post" action="/admin/news/delete" onsubmit="return confirm(\'Удалить пост?\')">'
@@ -3199,8 +3311,9 @@ def admin_news_page(_: bool = Depends(verify_admin)):
         '<div class="card">'
         '<form method="post" action="/admin/news">'
         '<div class="field"><label>Заголовок</label><input name="title" required></div>'
-        '<div class="field"><label>Текст (поддерживается простой markdown: **жирный**, *курсив*, переносы строк)</label>'
-        '<textarea name="body" rows="6" required></textarea></div>'
+        '<div class="field"><label>Текст</label>'
+        f'{_rich_text_editor_html("body_new")}'
+        '</div>'
         f'<div class="field"><label>Дата публикации</label><input type="datetime-local" name="published_at" value="{now_local}" required>'
         '<div style="color:#555;font-size:12px;margin-top:4px">Можно поставить дату в прошлом, чтобы опубликовать пост архивом — он встанет на своё место по хронологии.</div></div>'
         '<button class="btn" type="submit">Опубликовать</button>'
@@ -3228,8 +3341,9 @@ def admin_news_edit_page(post_id: int, _: bool = Depends(verify_admin)):
         '<div class="card">'
         f'<form method="post" action="/admin/news/{p["id"]}/edit">'
         f'<div class="field"><label>Заголовок</label><input name="title" value="{html.escape(p["title"])}" required></div>'
-        '<div class="field"><label>Текст (поддерживается простой markdown: **жирный**, *курсив*, переносы строк)</label>'
-        f'<textarea name="body" rows="6" required>{html.escape(p["body"])}</textarea></div>'
+        '<div class="field"><label>Текст</label>'
+        f'{_rich_text_editor_html("body_edit", p["body"])}'
+        '</div>'
         f'<div class="field"><label>Дата публикации</label><input type="datetime-local" name="published_at" value="{dt_value}" required></div>'
         '<button class="btn" type="submit">Сохранить</button>'
         '</form></div>'
@@ -3242,18 +3356,23 @@ def admin_news_edit_page(post_id: int, _: bool = Depends(verify_admin)):
 async def admin_news_create(request: Request, _: bool = Depends(verify_admin)):
     form = await request.form()
     title = (form.get("title") or "").strip()
-    text = (form.get("body") or "").strip()
+    raw_html = form.get("body") or ""
+    clean_html = sanitize_news_html(raw_html)
+    # После санитизации у пустого редактора остаётся пустая обёртка типа
+    # "<div><br></div>" — текстового содержимого там ноль, проверяем именно
+    # его, а не сырую HTML-строку (которая непуста даже без единого символа).
+    has_text = bool(re.sub(r"<[^>]+>", "", clean_html).strip())
     published_at = (form.get("published_at") or "").strip()
-    if title and text:
+    if title and has_text:
         # datetime-local отдаёт "YYYY-MM-DDTHH:MM" — приводим к тому же формату,
         # что и datetime('now') в SQLite ("YYYY-MM-DD HH:MM:SS"), чтобы сортировка
         # строкой (ORDER BY created_at) работала корректно вперемешку со старыми записями.
         created_at = published_at.replace("T", " ") + ":00" if published_at else None
         with get_db() as conn:
             if created_at:
-                conn.execute("INSERT INTO news_posts (title, body, created_at) VALUES (?,?,?)", (title, text, created_at))
+                conn.execute("INSERT INTO news_posts (title, body, created_at) VALUES (?,?,?)", (title, clean_html, created_at))
             else:
-                conn.execute("INSERT INTO news_posts (title, body) VALUES (?,?)", (title, text))
+                conn.execute("INSERT INTO news_posts (title, body) VALUES (?,?)", (title, clean_html))
     return RedirectResponse("/admin/news", status_code=303)
 
 
@@ -3261,14 +3380,16 @@ async def admin_news_create(request: Request, _: bool = Depends(verify_admin)):
 async def admin_news_update(post_id: int, request: Request, _: bool = Depends(verify_admin)):
     form = await request.form()
     title = (form.get("title") or "").strip()
-    text = (form.get("body") or "").strip()
+    raw_html = form.get("body") or ""
+    clean_html = sanitize_news_html(raw_html)
+    has_text = bool(re.sub(r"<[^>]+>", "", clean_html).strip())
     published_at = (form.get("published_at") or "").strip()
-    if title and text and published_at:
+    if title and has_text and published_at:
         created_at = published_at.replace("T", " ") + ":00"
         with get_db() as conn:
             conn.execute(
                 "UPDATE news_posts SET title=?, body=?, created_at=? WHERE id=?",
-                (title, text, created_at, post_id)
+                (title, clean_html, created_at, post_id)
             )
     return RedirectResponse("/admin/news", status_code=303)
 

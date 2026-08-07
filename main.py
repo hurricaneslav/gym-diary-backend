@@ -1561,6 +1561,31 @@ def search_users(q: str = "", x_init_data: str = Header(...)):
     return [{"id": r["user_id"], "username": r["username"], "name": r["first_name"] or r["username"]} for r in rows]
 
 
+def _add_friends_instant(conn, uid: str, tid: str):
+    """
+    Мгновенное добавление в друзья без заявки — используется только для
+    приглашения по персональной ссылке: сам факт того, что человек получил
+    и открыл именно эту ссылку, уже подтверждает обе стороны (её сгенерировал
+    и осознанно отправил владелец, её осознанно открыл получатель) — заявка
+    с подтверждением тут не нужна, в отличие от добавления через поиск по
+    юзернейму, где принимающая сторона видит впервые слышащее имя.
+    Если уже висит встречная заявка (например, до этого искали друг друга по
+    юзернейму) — она автоматически закрывается как принятая, чтобы не остался
+    задублированный pending-запрос рядом с уже установленной дружбой.
+    """
+    a, b = normalize_pair(uid, tid)
+    already = conn.execute("SELECT 1 FROM friends WHERE user_a=? AND user_b=?", (a, b)).fetchone()
+    if already:
+        return {"status": "already_friends"}
+    conn.execute(
+        "UPDATE friend_requests SET status='accepted', responded_at=datetime('now') "
+        "WHERE status='pending' AND ((from_user_id=? AND to_user_id=?) OR (from_user_id=? AND to_user_id=?))",
+        (uid, tid, tid, uid)
+    )
+    conn.execute("INSERT OR IGNORE INTO friends (user_a, user_b) VALUES (?,?)", (a, b))
+    return {"status": "accepted"}
+
+
 def _create_friend_request(conn, uid: str, tid: str):
     """
     Создаёт заявку в друзья uid → tid, либо — если tid уже отправил такую же
@@ -1614,6 +1639,8 @@ def add_friend_by_username(body: FriendUsernameIn, x_init_data: str = Header(...
 
 @app.post("/friends/add-by-code")
 def add_friend_by_code(body: FriendCodeIn, x_init_data: str = Header(...)):
+    # Добавление по персональной ссылке-приглашению — сразу в друзья, без
+    # заявки на подтверждение (см. docstring _add_friends_instant).
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         target = conn.execute("SELECT user_id FROM users WHERE invite_code=?", (body.code.strip(),)).fetchone()
@@ -1622,7 +1649,7 @@ def add_friend_by_code(body: FriendCodeIn, x_init_data: str = Header(...)):
         tid = target["user_id"]
         if tid == uid:
             return {"status": "already_friends"}
-        result = _create_friend_request(conn, uid, tid)
+        result = _add_friends_instant(conn, uid, tid)
     return result
 
 

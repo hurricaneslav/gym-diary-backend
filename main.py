@@ -493,21 +493,32 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
 def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list,
                          low, high, increment, prior_fail_streak: int):
     """
-    По факту одной heavy/"стандартной" сессии (по каждому подходу отдельно) решает новую
-    точку (anchor_weight, anchor_reps_detail), новый fail_streak и флаг was_hold (был ли
-    это настоящий Hold, а не ветка провала/Step-Up) — was_hold нужен вызывающему коду, чтобы
-    решить, применять ли модификаторы по RIR (см. apply_progress_modifiers: RIR — диагностика
-    ОДНОЙ сессии, и накладывать её поправку на ветку "провалил низ диапазона" нельзя, иначе
-    противоречивый RIR может подменить честный провал ростом веса, см. историю бага).
+    По факту одной heavy/"стандартной" сессии решает новую точку (anchor_weight,
+    anchor_reps_detail) и новый fail_streak. Классическая двойная прогрессия по
+    подходам: цель по повторам растёт ТОЛЬКО когда абсолютно ВСЕ подходы сессии
+    выполнили текущий план — тогда план целиком (все подходы разом) переходит на
+    следующее число повторов. Если хотя бы один подход не дотянул — план не растёт
+    вообще ни по одному подходу (в том числе по тем, что сами по себе справились):
+    дать успешному подходу убежать вперёд означало бы подвести его ближе к отказу
+    и тем самым отнять у отстающих подходов шанс когда-либо его догнать — что
+    противоречит самому смыслу метода (см. историю бага и обсуждение с пользователем).
 
-    Step UP:   все рабочие подходы достигли верха диапазона → вес +increment, повторы к низу.
-    Hold:      хотя бы один подход не дотянул до верха. Если ВСЕ подходы хотя бы повторили
-               СВОЙ план — цель по каждому подходу, что не на потолке, +1 повтор. Если хоть
-               один подход не дотянул до своего плана — сессия целиком повторяется без
-               изменений (не растим цель по одним подходам, пока другие в той же сессии не
-               справились — иначе получается, что подход №1 продолжает расти, даже когда
-               подходы №2-3 уже проваливаются на прежней цели, что физически нереалистично).
-    Step DOWN: 1-й подход не набрал низ диапазона ДВАЖДЫ подряд на одном весе → -10%.
+    Step UP:   ВСЕ рабочие подходы достигли верха диапазона → вес +increment,
+               повторы всех подходов — к низу нового диапазона.
+    Climb:     не на потолке, но ВСЕ подходы выполнили свою текущую цель — цель
+               ВСЕХ подходов разом растёт на +1 (до потолка диапазона).
+    Hold:      не все подходы выполнили свою цель — план держится на месте по
+               всем подходам, ЗА ИСКЛЮЧЕНИЕМ последнего по порядку подхода: если
+               не дотянул именно последний — его личная цель понижается прямо до
+               факта (последний подход в сессии трактуется как разведочный:
+               докуда реально хватило сил на этот раз, чтобы следующий заход был
+               честным, а не попыткой повторить то, что уже не получилось).
+    Step DOWN: 1-й подход не набрал СВОЙ ЗАПЛАНИРОВАННЫЙ минимум (не абсолютный
+               low диапазона — план может стартовать и ниже low, пока разгоняется
+               к нему) ДВАЖДЫ подряд на одном весе → -10%.
+               Отслеживается только по первому подходу (обычно самому нагруженному
+               в сессии) — общий вес один на всю сессию, поэтому нужен один сигнал,
+               а не по подходу.
     """
     n = len(planned_reps_detail)
     if len(actual_detail) < n:
@@ -522,7 +533,7 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
     actual_weight = actual_detail[0]["weight"]
     actual_reps = [int(s["reps"]) for s in actual_detail[:n]]
 
-    if actual_reps[0] < low and actual_weight == planned_weight:
+    if actual_reps[0] < planned_reps_detail[0] and actual_weight == planned_weight:
         if prior_fail_streak >= 1:
             return round_to_increment(actual_weight * 0.9, increment), [low] * n, 0, False
         return planned_weight, planned_reps_detail, prior_fail_streak + 1, False
@@ -531,11 +542,19 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
         return round_to_increment(actual_weight + increment, increment), [low] * n, 0, False
 
     if all(actual_reps[i] >= planned_reps_detail[i] for i in range(n)):
-        new_reps = [high if r >= high else max(1, r + 1) for r in actual_reps]
+        # Climb — все подходы выполнили план (и не все ещё на потолке, иначе сработала
+        # бы ветка Step UP выше) → вся сессия разом растёт на +1 повторение.
+        new_reps = [min(high, r + 1) for r in planned_reps_detail]
         return actual_weight, new_reps, 0, True
-    # Хотя бы один подход не дотянул до своей же цели — повторяем сессию без изменений,
-    # вместо того чтобы поднимать цель по подходам, которые в этот раз справились.
-    return actual_weight, list(planned_reps_detail), 0, True
+
+    # Hold — план держится на месте по всем подходам, кроме последнего при провале:
+    # тот понижается прямо до факта (см. docstring выше).
+    last = n - 1
+    new_reps = list(planned_reps_detail)
+    if actual_reps[last] < planned_reps_detail[last]:
+        new_reps[last] = max(1, actual_reps[last])
+    return actual_weight, new_reps, 0, True
+
 
 
 # ── Унилатеральный режим (независимые треки по сторонам) ────────────────────
@@ -650,55 +669,26 @@ def _unpack_unilateral_actual(actual_detail: list):
 
 def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, low, high, increment,
                               rir, beginner_mode: bool, was_hold: bool = True):
-    """rir — по первому (диагностическому) подходу, необязателен (см. решение сделать RIR
-    опциональным); beginner_mode — активен до первого исхода, который не Step Up. was_hold —
-    флаг от adapt_actual_detail: True только для настоящего Hold (не ветки провала низа
-    диапазона) — см. пояснение ниже, почему это важно.
+    """beginner_mode — активен до первого исхода, который не Step Up.
 
-    ВАЖНО: раньше высокий RIR полностью игнорировался, если базовое решение (adapt_actual_detail)
-    было Hold (веса не хватило, повторы не в отказ, но и не все подходы на потолке диапазона) —
-    функция выходила по первой же строчке ДО того, как посмотреть на rir вообще. На практике это
-    значило: если человек делает подходы с большим запасом сил (RIR 3+), но чисто по количеству
-    повторов это ещё не Hold-потолок, — вес НИКОГДА не подрастёт, пока повторы сами не доберутся
-    до верха диапазона, сколько бы запаса сил ни было. Теперь: Hold + RIR>=3 промотируется до
-    Step Up (как если бы все подходы уже добрались до верха диапазона) — RIR тут сильнее сигнал
-    о реальной тяжести подхода, чем сырое количество повторов.
-
-    Симметрично: Hold + RIR<=0 (повторы не на потолке, но запаса уже нет) раньше тоже никак не
-    обрабатывался — план просто держал текущий вес и поднимал цель по повторам, как будто всё
-    нормально. Это физически нереалистично: если человек уже выложился в отказ на подходе, который
-    формально даже не на потолке диапазона, — вес для этих повторов уже явно многовато, а не "чуть
-    маловат". Снижаем сразу, на один шаг увеличения, не дожидаясь повторной неудачи (в отличие от
-    провала по количеству повторов ниже низа диапазона — там сначала предупреждение, только второй
-    подряд провал снижает вес; здесь сигнал другой и более прямой, ждать нет смысла).
-
-    Про was_hold: и настоящий Hold, и "первое предупреждение о провале низа диапазона" (см.
-    adapt_actual_detail) возвращают new_weight == planned_weight — по одному этому равенству их
-    не отличить. А RIR — диагностика ОДНОЙ конкретной сессии, поэтому накладывать её на ветку
-    провала опасно: если провалил именно низ диапазона, RIR (даже большой) не должен подменять
-    честное предупреждение ростом веса — данные противоречат друг другу, и доверять в этом случае
-    нужно факту "не дотянул до низа", а не диагностическому RIR.
+    RIR-модификатор отключён полностью (см. историю бага): он вмешивался почти в
+    каждый обычный Hold — RIR>=3 (частое, совершенно нормальное значение при
+    работе с не-предельным весом) промотировал обычное "+1 повтор" сразу до
+    Step Up, а RIR<=0 снижал вес прямо на Hold, хотя человек мог просто честно
+    выполнить план без единого признака провала. Симптом на практике: скачки
+    веса на целый инкремент или необъяснимые снижения после сессий, где всё
+    прошло по плану, — сильно раньше и чаще, чем должна расти прогрессия.
+    Параметр rir оставлен в сигнатуре ради обратной совместимости вызовов и
+    сохранности уже записанных значений actual_rir в БД, но здесь больше ни на
+    что не влияет; RIR тестового подхода (start_rir, при создании прогрессии)
+    эту функцию не затрагивает и продолжает работать как раньше.
     """
-    if was_hold and new_weight == planned_weight and rir is not None:
-        if rir >= 3:
-            new_weight = round_to_increment(planned_weight + increment, increment)
-            new_reps_detail = [low] * len(new_reps_detail)
-        elif rir <= 0:
-            return round_to_increment(planned_weight - increment, increment), [low] * len(new_reps_detail)
     if new_weight <= planned_weight:
         return new_weight, new_reps_detail
     step = new_weight - planned_weight
     if beginner_mode:
         step *= 2
         new_weight = round_to_increment(planned_weight + step, increment)
-    if rir is not None:
-        if rir <= 0:
-            # формально выполнил план, но каждый подход "в отказ" — не спешим с весом,
-            # держим ещё один заход на потолке диапазона
-            return planned_weight, [high] * len(new_reps_detail)
-        if rir >= 3:
-            # с большим запасом сил — не тратим недели на подъём по одному шагу
-            new_weight = round_to_increment(new_weight + step, increment)
     return new_weight, new_reps_detail
 
 
@@ -730,20 +720,44 @@ def is_amrap_session(session_index: int, frequency: int, amrap_every_weeks):
     return phase == 0 and week % amrap_every_weeks == 0
 
 
-def adapt_amrap(planned_weight, high, low, increment, actual_weight, actual_reps):
-    """Последний (AMRAP) подход теста -> новая рабочая точка. Прогноз 1ПМ берём от
-    текущего плана на верху диапазона повторов, сравниваем с фактическим 1ПМ."""
-    predicted_1rm = epley_1rm(planned_weight, high)
+def adapt_amrap(planned_weight, planned_reps, low, increment, actual_weight, actual_reps):
+    """
+    Последний (AMRAP, в отказ) подход теста -> новая рабочая точка (вес, повторы
+    для новой цели ВСЕХ подходов сессии).
+
+    Прогноз 1ПМ берётся от ТЕКУЩЕГО плана этой сессии (planned_weight на
+    planned_reps) — то, сколько подход должен был показать по обычной
+    прогрессии, если бы это был не тест, а рядовая heavy-сессия. Раньше прогноз
+    брался от верха диапазона повторов (high) — из-за этого честное совпадение
+    факта с текущим планом читалось как "просадка" (сравнение шло с гипотезой
+    "а если бы ты сделал реповый максимум диапазона"), и обычный, ожидаемый
+    результат теста почти всегда скатывался в нейтральную ветку, которая
+    форсировала Step Up на целый инкремент, перепрыгивая остаток диапазона
+    повторов вместо того, чтобы просто продолжить обычную прогрессию оттуда,
+    где план сейчас реально находится.
+
+    - Явный прорыв силы (факт заметно выше прогноза) — пересчитываем рабочий
+      вес от факта на низ диапазона повторов, СРАЗУ отражая новый уровень силы.
+    - Явная просадка (факт заметно ниже прогноза) — вес мягко снижается,
+      повторы — на низ диапазона (осторожный рестарт).
+    - Нейтральный исход (факт близко к прогнозу — ни то ни другое) — тест не
+      считается решающим сигналом сам по себе: возвращаем None, вызывающий код
+      в этом случае прогоняет сессию через обычную двойную прогрессию по
+      подходам (adapt_actual_detail), как рядовую heavy-сессию, а не тест —
+      план продолжает идти оттуда, где сейчас реально находится, а не
+      форсированно прыгает на целый инкремент веса.
+
+    Возвращает новый рабочий вес, либо None (нейтральный исход — см. выше).
+    """
+    predicted_1rm = epley_1rm(planned_weight, planned_reps)
     actual_1rm = epley_1rm(actual_weight, actual_reps)
     delta = (actual_1rm - predicted_1rm) / predicted_1rm if predicted_1rm else 0
 
     if delta >= AMRAP_BREAKTHROUGH_PCT:
-        new_weight = round_to_increment(actual_1rm / (1 + low / 30), increment)
-    elif delta <= AMRAP_SETBACK_PCT:
-        new_weight = round_to_increment(planned_weight * 0.95, increment)
-    else:
-        new_weight = round_to_increment(planned_weight + increment, increment)
-    return new_weight
+        return round_to_increment(actual_1rm / (1 + low / 30), increment)
+    if delta <= AMRAP_SETBACK_PCT:
+        return round_to_increment(planned_weight * 0.95, increment)
+    return None
 
 
 # ── Модели ────────────────────────────────────────────────────────────────────
@@ -2600,16 +2614,24 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     # раскладываем агрегат на нужное число подходов одним и тем же значением
                     actual_detail = [{"weight": body.actual_weight, "reps": body.actual_reps}] * (body.actual_sets or 1)
 
+                amrap_result = None
                 if session["is_amrap"] and body.actual_detail:
                     last = body.actual_detail[-1]
-                    new_w = adapt_amrap(
-                        session["planned_weight"], prog["rep_range_high"], prog["rep_range_low"],
+                    amrap_result = adapt_amrap(
+                        session["planned_weight"], session["planned_reps"], prog["rep_range_low"],
                         prog["increment"], last.weight, last.reps
                     )
+
+                if amrap_result is not None:
+                    # Явный прорыв или явная просадка — тест дал решающий сигнал,
+                    # пересчитываем рабочую точку от него напрямую.
+                    new_w = amrap_result
                     new_r = [prog["rep_range_low"]] * eff_sets
                     new_fail = 0
                     still_beginner = was_beginner and new_w > session["planned_weight"]
                 else:
+                    # Нейтральный исход AMRAP-теста (или это вообще не AMRAP-сессия) —
+                    # обычная двойная прогрессия по подходам, как для рядовой сессии.
                     new_w, new_r, new_fail, hold = adapt_actual_detail(
                         session["planned_weight"], planned_reps_detail, actual_detail,
                         prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
@@ -2821,10 +2843,13 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         else:
                             actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
                         planned_w_at_the_time = s["planned_weight"]
+                        amrap_result = None
                         if s["is_amrap"] and actual_detail:
                             last = actual_detail[-1]
-                            w = adapt_amrap(planned_w_at_the_time, prog["rep_range_high"], prog["rep_range_low"],
+                            amrap_result = adapt_amrap(planned_w_at_the_time, s["planned_reps"], prog["rep_range_low"],
                                             prog["increment"], last["weight"], last["reps"])
+                        if amrap_result is not None:
+                            w = amrap_result
                             r = [prog["rep_range_low"]] * eff_sets
                             fail = 0
                         else:

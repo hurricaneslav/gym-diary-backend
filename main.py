@@ -449,14 +449,6 @@ def role_adjust_detail(role: str, anchor_weight: float, anchor_reps_detail: list
     return anchor_weight, light_reps
 
 
-def climb_detail(weight: float, reps_detail: list, low: int, high: int, increment: float):
-    """Шаг двойной прогрессии на границе недели (используется для ОПТИМИСТИЧНОГО предпоказа
-    цели до того, как сессия реально отыграна — реальный факт потом переопределит анкор
-    через adapt_actual_detail)."""
-    if all(r >= high for r in reps_detail):
-        return round_to_increment(weight + increment, increment), [low] * len(reps_detail)
-    return weight, [min(high, r + 1) for r in reps_detail]
-
 
 def normalize_range_detail(weight: float, reps_detail: list, low: int, high: int, increment: float):
     """Проекция текущей точки в новый диапазон повторов при ручном редактировании параметров
@@ -472,6 +464,15 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
     Роль каждого индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне (не сдвигается при
     перегенерации), поэтому пересчёт с середины недели не путает фазу heavy/light.
     Возвращает список кортежей (session_index, role, planned_weight, planned_reps_detail, planned_sets).
+
+    ВАЖНО: план на все сессии, которые ещё не наступили (выше только что залогированной),
+    просто повторяет anchor без изменений — никакого оптимистичного прироста наперёд.
+    Раньше (climb_detail) план на будущие недели рос сам по себе на границе шаблона, вообще
+    не дожидаясь реального результата — из-за этого план на несыгранные сессии мог "убежать
+    вперёд" не в такт с тем, как реально считает adapt_actual_detail после каждого лога (см.
+    историю бага: план показывал скачки/пропуски чисел повторов на сессиях, которые ещё не
+    были сыграны). Единственное место, где цель по повторам реально растёт — after-the-fact
+    в adapt_actual_detail, когда сессия становится текущей и логируется по факту.
     """
     template = role_template(exercise_type, frequency)
     freq = len(template)
@@ -479,8 +480,6 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
     out = []
     for idx in range(from_index, total_sessions + 1):
         phase = (idx - 1) % freq
-        if idx > from_index and phase == 0:
-            w, reps_detail = climb_detail(w, reps_detail, low, high, increment)
         role = template[phase]
         if role in (None, "heavy"):
             out.append((idx, role, w, list(reps_detail), sets_count))

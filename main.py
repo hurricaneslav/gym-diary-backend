@@ -288,6 +288,17 @@ def init_db():
         if "actual_detail" not in cols:
             conn.execute("ALTER TABLE progression_sessions ADD COLUMN actual_detail TEXT")
 
+        # "Медленный режим" адаптивной скорости прогрессии: после любого провала подхода
+        # прогрессия переходит на осторожную скорость (только ведущий/первый подход растёт,
+        # остальные поочерёдно подтягиваются к его уровню, по одному подходу за сессию) и
+        # остаётся в этом режиме, пока какой-то подход не покажет явный прирост сверх своего
+        # плана ("чудо") — тогда прогрессия сразу возвращается к быстрой скорости (все подходы
+        # растут вместе). См. adapt_actual_detail для полной логики.
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(progressions)").fetchall()]
+        for col in ("is_slow_mode", "is_slow_mode_l", "is_slow_mode_r"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE progressions ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+
         # Независимые треки веса/повторов по сторонам (Л/П) для unilateral-прогрессий —
         # раньше был один общий вес на обе стороны (current_weight), теперь у каждой стороны
         # своё состояние, чтобы одна сторона не бутылочило прогресс другой.
@@ -456,8 +467,69 @@ def normalize_range_detail(weight: float, reps_detail: list, low: int, high: int
     return weight, [min(high, max(low, int(r))) for r in reps_detail]
 
 
+def project_full_success(planned_reps_detail: list, actual_reps: list, high: int, prior_slow_mode: bool):
+    """
+    Единая логика "что происходит с целью по повторам, когда сессия полностью выполнена"
+    (все подходы >= своего плана, но не все ещё на потолке диапазона — Step UP уже
+    отработан отдельно ДО вызова этой функции). Используется в двух местах: здесь же в
+    adapt_actual_detail (по факту реально сыгранной сессии) и в generate_remaining_sessions
+    для предпоказа ещё не сыгранных сессий (там actual_reps == planned_reps_detail, то есть
+    гипотеза "сыграем ровно по плану") — оба места ДОЛЖНЫ использовать один и тот же код,
+    иначе предпоказ будущих сессий разойдётся с тем, что реально произойдёт при точном
+    попадании в план (см. историю бага).
+
+    Адаптивная скорость прогрессии — три случая:
+
+    1) "Чудо" — какой-то подход показал результат СВЕРХ своего плана (например план был
+       неровным после подтягивания, а человек взял и перевыполнил). Это самый сильный сигнал:
+       прогрессия сразу возвращается на быструю скорость (slow_mode сбрасывается), новая цель
+       каждого подхода — его собственный факт +1, но не выше нового уровня первого/ведущего
+       подхода (+1 от его факта) — ведущий подход остаётся потолком новой цели, даже если
+       фактически кто-то поднял больше него.
+
+    2) План уже был РОВНЫЙ (все подходы на одном уровне) и это не "быстрый" режим замедления
+       (prior_slow_mode=False) — классическая двойная прогрессия: ВСЕ подходы растут на +1
+       вместе.
+
+    3) Иначе (план был неровный — кто-то отстаёт — ЛИБО мы уже в медленном режиме после
+       недавнего провала, даже если план успел снова выровняться и это выполнено ровно как
+       по плану) — осторожная скорость: если план ещё неровный, подтягиваем ОДИН отстающий
+       подход (по порядку) на +1 к уровню ведущего, не выше него; если план уже ровный (мы в
+       медленном режиме, но отстающие уже все подтянулись) — растёт только ведущий (первый)
+       подход, остальные ждут, когда прогрессия снова его нагонит. В обоих случаях slow_mode
+       остаётся включённым — вернуться к быстрой скорости можно только через "чудо" (случай 1).
+
+    Возвращает (new_reps_detail, new_slow_mode).
+    """
+    n = len(planned_reps_detail)
+    overperformed = any(actual_reps[i] > planned_reps_detail[i] for i in range(n))
+    if overperformed:
+        new_leader = min(high, actual_reps[0] + 1)
+        new_reps = [min(high, min(a + 1, new_leader)) for a in actual_reps]
+        return new_reps, False
+
+    leader = planned_reps_detail[0]
+    uniform_plan = all(p == leader for p in planned_reps_detail)
+
+    if uniform_plan and not prior_slow_mode:
+        return [min(high, p + 1) for p in planned_reps_detail], False
+
+    if uniform_plan:
+        new_reps = list(planned_reps_detail)
+        new_reps[0] = min(high, leader + 1)
+        return new_reps, True
+
+    new_reps = list(planned_reps_detail)
+    for i in range(1, n):
+        if new_reps[i] < leader:
+            new_reps[i] = min(leader, new_reps[i] + 1)
+            break
+    return new_reps, True
+
+
 def generate_remaining_sessions(exercise_type, frequency, low, high, increment, sets_count,
-                                 total_sessions, from_index, anchor_weight, anchor_reps_detail):
+                                 total_sessions, from_index, anchor_weight, anchor_reps_detail,
+                                 anchor_slow_mode: bool = False):
     """
     Строит план сессий от from_index (включительно) до total_sessions, начиная с состояния
     (anchor_weight, anchor_reps_detail) — цель ближайшей heavy/"стандартной" сессии, по подходам.
@@ -465,21 +537,26 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
     перегенерации), поэтому пересчёт с середины недели не путает фазу heavy/light.
     Возвращает список кортежей (session_index, role, planned_weight, planned_reps_detail, planned_sets).
 
-    ВАЖНО: план на все сессии, которые ещё не наступили (выше только что залогированной),
-    просто повторяет anchor без изменений — никакого оптимистичного прироста наперёд.
-    Раньше (climb_detail) план на будущие недели рос сам по себе на границе шаблона, вообще
-    не дожидаясь реального результата — из-за этого план на несыгранные сессии мог "убежать
-    вперёд" не в такт с тем, как реально считает adapt_actual_detail после каждого лога (см.
-    историю бага: план показывал скачки/пропуски чисел повторов на сессиях, которые ещё не
-    были сыграны). Единственное место, где цель по повторам реально растёт — after-the-fact
-    в adapt_actual_detail, когда сессия становится текущей и логируется по факту.
+    План на сессии, которые ещё не наступили, — ОПТИМИСТИЧНЫЙ предпоказ: на каждой границе
+    шаблона (после heavy+все его light-дни) считается гипотеза "а если сыграть точно по плану" —
+    через ту же project_full_success, что и реальное логирование, поэтому предпоказ и то, что
+    реально произойдёт при точном попадании в план, ВСЕГДА совпадают. Расхождение возможно
+    только когда реальный факт отличается от плана — тогда после лога anchor пересчитывается
+    по-настоящему и предпоказ сессий впереди строится уже от новой точки.
     """
     template = role_template(exercise_type, frequency)
     freq = len(template)
-    w, reps_detail = anchor_weight, list(anchor_reps_detail)
+    w, reps_detail, slow = anchor_weight, list(anchor_reps_detail), anchor_slow_mode
     out = []
     for idx in range(from_index, total_sessions + 1):
         phase = (idx - 1) % freq
+        if idx > from_index and phase == 0:
+            if all(r >= high for r in reps_detail):
+                w = round_to_increment(w + increment, increment)
+                reps_detail = [low] * len(reps_detail)
+                slow = False
+            else:
+                reps_detail, slow = project_full_success(reps_detail, reps_detail, high, slow)
         role = template[phase]
         if role in (None, "heavy"):
             out.append((idx, role, w, list(reps_detail), sets_count))
@@ -490,28 +567,23 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
 
 
 def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list,
-                         low, high, increment, prior_fail_streak: int):
+                         low, high, increment, prior_fail_streak: int, prior_slow_mode: bool = False):
     """
     По факту одной heavy/"стандартной" сессии решает новую точку (anchor_weight,
-    anchor_reps_detail) и новый fail_streak. Классическая двойная прогрессия по
-    подходам: цель по повторам растёт ТОЛЬКО когда абсолютно ВСЕ подходы сессии
-    выполнили текущий план — тогда план целиком (все подходы разом) переходит на
-    следующее число повторов. Если хотя бы один подход не дотянул — план не растёт
-    вообще ни по одному подходу (в том числе по тем, что сами по себе справились):
-    дать успешному подходу убежать вперёд означало бы подвести его ближе к отказу
-    и тем самым отнять у отстающих подходов шанс когда-либо его догнать — что
-    противоречит самому смыслу метода (см. историю бага и обсуждение с пользователем).
+    anchor_reps_detail), новый fail_streak и новый slow_mode (адаптивная скорость
+    прогрессии — см. project_full_success).
 
     Step UP:   ВСЕ рабочие подходы достигли верха диапазона → вес +increment,
-               повторы всех подходов — к низу нового диапазона.
-    Climb:     не на потолке, но ВСЕ подходы выполнили свою текущую цель — цель
-               ВСЕХ подходов разом растёт на +1 (до потолка диапазона).
-    Hold:      не все подходы выполнили свою цель — план держится на месте по
+               повторы всех подходов — к низу нового диапазона, slow_mode сбрасывается
+               (новый цикл диапазона начинается с чистого листа).
+    Climb/catch-up: не на потолке, все подходы выполнили минимум свой план —
+               см. project_full_success для точной логики (чудо/быстро/медленно).
+    Hold:      хотя бы один подход не выполнил свой план — план держится на месте по
                всем подходам, ЗА ИСКЛЮЧЕНИЕМ последнего по порядку подхода: если
                не дотянул именно последний — его личная цель понижается прямо до
-               факта (последний подход в сессии трактуется как разведочный:
-               докуда реально хватило сил на этот раз, чтобы следующий заход был
-               честным, а не попыткой повторить то, что уже не получилось).
+               факта. Это ЛЮБОЙ провал взводит slow_mode (следующий раз, даже если
+               план снова станет ровным и будет выполнен точно, скорость останется
+               осторожной — вернуться к быстрой можно только через явное перевыполнение).
     Step DOWN: 1-й подход не набрал СВОЙ ЗАПЛАНИРОВАННЫЙ минимум (не абсолютный
                low диапазона — план может стартовать и ниже low, пока разгоняется
                к нему) ДВАЖДЫ подряд на одном весе → -10%.
@@ -527,32 +599,30 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
         for i, s in enumerate(actual_detail):
             new_reps[i] = int(s["reps"])
         actual_weight = actual_detail[0]["weight"] if actual_detail else planned_weight
-        return actual_weight, new_reps, 0, False
+        return actual_weight, new_reps, 0, prior_slow_mode, False
 
     actual_weight = actual_detail[0]["weight"]
     actual_reps = [int(s["reps"]) for s in actual_detail[:n]]
 
     if actual_reps[0] < planned_reps_detail[0] and actual_weight == planned_weight:
         if prior_fail_streak >= 1:
-            return round_to_increment(actual_weight * 0.9, increment), [low] * n, 0, False
-        return planned_weight, planned_reps_detail, prior_fail_streak + 1, False
+            return round_to_increment(actual_weight * 0.9, increment), [low] * n, 0, True, False
+        return planned_weight, planned_reps_detail, prior_fail_streak + 1, True, False
 
     if all(r >= high for r in actual_reps):
-        return round_to_increment(actual_weight + increment, increment), [low] * n, 0, False
+        return round_to_increment(actual_weight + increment, increment), [low] * n, 0, False, False
 
     if all(actual_reps[i] >= planned_reps_detail[i] for i in range(n)):
-        # Climb — все подходы выполнили план (и не все ещё на потолке, иначе сработала
-        # бы ветка Step UP выше) → вся сессия разом растёт на +1 повторение.
-        new_reps = [min(high, r + 1) for r in planned_reps_detail]
-        return actual_weight, new_reps, 0, True
+        new_reps, new_slow = project_full_success(planned_reps_detail, actual_reps, high, prior_slow_mode)
+        return actual_weight, new_reps, 0, new_slow, True
 
     # Hold — план держится на месте по всем подходам, кроме последнего при провале:
-    # тот понижается прямо до факта (см. docstring выше).
+    # тот понижается прямо до факта (см. docstring выше). Любой провал взводит slow_mode.
     last = n - 1
     new_reps = list(planned_reps_detail)
     if actual_reps[last] < planned_reps_detail[last]:
         new_reps[last] = max(1, actual_reps[last])
-    return actual_weight, new_reps, 0, True
+    return actual_weight, new_reps, 0, True, True
 
 
 
@@ -568,13 +638,14 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
 # ниже, оставленных только для чтения/миграции старых прогрессий).
 
 def _generate_uni_sessions(exercise_type, frequency, low, high, increment, sets_count,
-                            total_sessions, from_index, wL, rL_detail, wR, rR_detail):
+                            total_sessions, from_index, wL, rL_detail, wR, rR_detail,
+                            slowL: bool = False, slowR: bool = False):
     """Прогоняет generate_remaining_sessions дважды (по разу на сторону, каждый раз с обычным
     sets_count — без удвоения) и сшивает результат по индексу сессии в один plan на пару."""
     left = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
-                                        sets_count, total_sessions, from_index, wL, rL_detail)
+                                        sets_count, total_sessions, from_index, wL, rL_detail, slowL)
     right = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
-                                         sets_count, total_sessions, from_index, wR, rR_detail)
+                                         sets_count, total_sessions, from_index, wR, rR_detail, slowR)
     return [(idx, role, wl, rl, wr, rr, sc) for (idx, role, wl, rl, sc), (_, _, wr, rr, _) in zip(left, right)]
 
 
@@ -2123,7 +2194,8 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
         sessions = generate_remaining_sessions(
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
+            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail,
+            bool(prog["is_slow_mode"])
         )
         _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                           frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2132,7 +2204,8 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         detail = json.loads(prog["current_reps_detail"]) if prog["current_reps_detail"] else [prog["current_reps"]] * eff_sets
         sessions = generate_remaining_sessions(
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail
+            eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail,
+            bool(prog["is_slow_mode"])
         )
         _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                           frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2143,7 +2216,8 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         sessions = _generate_uni_sessions(
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
             sets_count, new_total, prog["total_sessions"] + 1,
-            prog["current_weightL"], rL, prog["current_weightR"], rR
+            prog["current_weightL"], rL, prog["current_weightR"], rR,
+            bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"])
         )
         _insert_uni_sessions(conn, progression_id, sessions, frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
     conn.execute("UPDATE progressions SET total_sessions=? WHERE id=?", (new_total, progression_id))
@@ -2392,7 +2466,7 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 )
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], frequency, low, high, increment, sets_count,
-                    prog["total_sessions"], nxt, cw, detail
+                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"])
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=sets_count,
                                   frequency=frequency, amrap_every_weeks=amrap_weeks)
@@ -2411,7 +2485,7 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 )
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], frequency, low, high, increment, eff_sets,
-                    prog["total_sessions"], nxt, cw, detail
+                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"])
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=sets_count,
                                   frequency=frequency, amrap_every_weeks=amrap_weeks)
@@ -2431,7 +2505,8 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 )
                 sessions = _generate_uni_sessions(
                     prog["exercise_type"], frequency, low, high, increment, sets_count,
-                    prog["total_sessions"], nxt, cwL, rL, cwR, rR
+                    prog["total_sessions"], nxt, cwL, rL, cwR, rR,
+                    bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"])
                 )
                 _insert_uni_sessions(conn, progression_id, sessions, frequency=frequency, amrap_every_weeks=amrap_weeks)
     return {"ok": True}
@@ -2512,17 +2587,19 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 actual_detailL = [{"weight": wL, "reps": r} for r in actualRepsL]
                 actual_detailR = [{"weight": wR, "reps": r} for r in actualRepsR]
 
-                new_wL, new_rL, new_failL, hold_L = adapt_actual_detail(
+                new_wL, new_rL, new_failL, new_slowL, hold_L = adapt_actual_detail(
                     plannedWL, plannedL, actual_detailL,
-                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakL"]
+                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakL"],
+                    bool(prog["is_slow_mode_l"])
                 )
                 new_wL, new_rL = apply_progress_modifiers(
                     new_wL, new_rL, plannedWL, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                     body.actual_rir, was_beginner, hold_L
                 )
-                new_wR, new_rR, new_failR, hold_R = adapt_actual_detail(
+                new_wR, new_rR, new_failR, new_slowR, hold_R = adapt_actual_detail(
                     plannedWR, plannedR, actual_detailR,
-                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakR"]
+                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakR"],
+                    bool(prog["is_slow_mode_r"])
                 )
                 new_wR, new_rR = apply_progress_modifiers(
                     new_wR, new_rR, plannedWR, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2533,9 +2610,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
+                    "is_slow_mode_l=?, is_slow_mode_r=?, "
                     "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
                     (new_wL, new_wR, json.dumps(new_rL), json.dumps(new_rR), new_failL, new_failR,
-                     int(still_beginner), progression_id)
+                     int(new_slowL), int(new_slowR), int(still_beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
@@ -2545,7 +2623,8 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     sessions = _generate_uni_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], sets_count, prog["total_sessions"],
-                        session["session_index"] + 1, new_wL, new_rL, new_wR, new_rR
+                        session["session_index"] + 1, new_wL, new_rL, new_wR, new_rR,
+                        new_slowL, new_slowR
                     )
                     _insert_uni_sessions(conn, progression_id, sessions, frequency=prog["frequency"],
                                           amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2572,9 +2651,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     actual_detail = [{"weight": body.actual_weight, "reps": body.actual_reps}] * (body.actual_sets or 1)
                     actual_detail = actual_detail * 2
 
-                new_w, new_r, new_fail, hold = adapt_actual_detail(
+                new_w, new_r, new_fail, new_slow, hold = adapt_actual_detail(
                     session["planned_weight"], planned_reps_detail, actual_detail,
-                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
+                    prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"],
+                    bool(prog["is_slow_mode"])
                 )
                 new_w, new_r = apply_progress_modifiers(
                     new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2583,8 +2663,8 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 still_beginner = was_beginner and new_w > session["planned_weight"]
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
-                    "fail_streak=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
-                    (new_w, new_r[0], json.dumps(new_r), new_fail, int(still_beginner), progression_id)
+                    "fail_streak=?, is_slow_mode=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                    (new_w, new_r[0], json.dumps(new_r), new_fail, int(new_slow), int(still_beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
@@ -2594,7 +2674,7 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r
+                        session["session_index"] + 1, new_w, new_r, new_slow
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2623,17 +2703,20 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
 
                 if amrap_result is not None:
                     # Явный прорыв или явная просадка — тест дал решающий сигнал,
-                    # пересчитываем рабочую точку от него напрямую.
+                    # пересчитываем рабочую точку от него напрямую; сбрасываем slow_mode —
+                    # это фактически новая точка отсчёта.
                     new_w = amrap_result
                     new_r = [prog["rep_range_low"]] * eff_sets
                     new_fail = 0
+                    new_slow = False
                     still_beginner = was_beginner and new_w > session["planned_weight"]
                 else:
                     # Нейтральный исход AMRAP-теста (или это вообще не AMRAP-сессия) —
                     # обычная двойная прогрессия по подходам, как для рядовой сессии.
-                    new_w, new_r, new_fail, hold = adapt_actual_detail(
+                    new_w, new_r, new_fail, new_slow, hold = adapt_actual_detail(
                         session["planned_weight"], planned_reps_detail, actual_detail,
-                        prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"]
+                        prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"],
+                        bool(prog["is_slow_mode"])
                     )
                     new_w, new_r = apply_progress_modifiers(
                         new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2643,8 +2726,8 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     still_beginner = was_beginner and new_w > session["planned_weight"]
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
-                    "fail_streak=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
-                    (new_w, new_r[0], json.dumps(new_r), new_fail, int(still_beginner), progression_id)
+                    "fail_streak=?, is_slow_mode=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                    (new_w, new_r[0], json.dumps(new_r), new_fail, int(new_slow), int(still_beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>?",
@@ -2654,7 +2737,7 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r
+                        session["session_index"] + 1, new_w, new_r, new_slow
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2715,6 +2798,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 wL, wR = prog["start_weightL"], prog["start_weightR"]
                 rL, rR = [prog["start_repsL"]] * sets_count, [prog["start_repsR"]] * sets_count
                 failL, failR = 0, 0
+                slowL, slowR = False, False
                 # Точную историческую траекторию beginner_mode по сессиям мы не храним — берём
                 # текущее значение как допущение для всего replay (как и раньше, до разделения
                 # по сторонам); неточность возможна только в редком случае отмены именно той
@@ -2741,17 +2825,17 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         actual_detailL = [{"weight": wl_val, "reps": r} for r in actualRepsL]
                         actual_detailR = [{"weight": wr_val, "reps": r} for r in actualRepsR]
 
-                        wL, rL, failL, holdL = adapt_actual_detail(
+                        wL, rL, failL, slowL, holdL = adapt_actual_detail(
                             plannedWL_t, plannedL, actual_detailL,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failL
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failL, slowL
                         )
                         wL, rL = apply_progress_modifiers(
                             wL, rL, plannedWL_t, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                             s["actual_rir"], beginner, holdL
                         )
-                        wR, rR, failR, holdR = adapt_actual_detail(
+                        wR, rR, failR, slowR, holdR = adapt_actual_detail(
                             plannedWR_t, plannedR, actual_detailR,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failR
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failR, slowR
                         )
                         wR, rR = apply_progress_modifiers(
                             wR, rR, plannedWR_t, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2761,8 +2845,10 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
+                    "is_slow_mode_l=?, is_slow_mode_r=?, "
                     "beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
-                    (wL, wR, json.dumps(rL), json.dumps(rR), failL, failR, int(beginner), progression_id)
+                    (wL, wR, json.dumps(rL), json.dumps(rR), failL, failR, int(slowL), int(slowR),
+                     int(beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
@@ -2770,7 +2856,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 new_sessions = _generate_uni_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], sets_count, prog["total_sessions"], target["session_index"], wL, rL, wR, rR
+                    prog["increment"], sets_count, prog["total_sessions"], target["session_index"], wL, rL, wR, rR,
+                    slowL, slowR
                 )
                 _insert_uni_sessions(conn, progression_id, new_sessions, frequency=prog["frequency"],
                                       amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2781,6 +2868,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 w = prog["start_weight"]
                 r = [prog["start_reps"]] * eff_sets
                 fail = 0
+                slow = False
                 beginner = bool(prog["beginner_mode"])
                 for s in sessions:
                     if s["session_index"] >= target["session_index"]:
@@ -2798,9 +2886,9 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
                             actual_detail = actual_detail * 2
                         planned_w_at_the_time = s["planned_weight"]
-                        w, r, fail, hold = adapt_actual_detail(
+                        w, r, fail, slow, hold = adapt_actual_detail(
                             planned_w_at_the_time, planned_reps_detail, actual_detail,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow
                         )
                         w, r = apply_progress_modifiers(
                             w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2809,8 +2897,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         beginner = beginner and w > planned_w_at_the_time
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
-                    "beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
-                    (w, r[0], json.dumps(r), fail, int(beginner), progression_id)
+                    "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
+                    (w, r[0], json.dumps(r), fail, int(slow), int(beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
@@ -2818,7 +2906,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r
+                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2827,6 +2915,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 w = prog["start_weight"]
                 r = [prog["start_reps"]] * eff_sets
                 fail = 0
+                slow = False
                 beginner = bool(prog["beginner_mode"])
                 for s in sessions:
                     if s["session_index"] >= target["session_index"]:
@@ -2851,10 +2940,11 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             w = amrap_result
                             r = [prog["rep_range_low"]] * eff_sets
                             fail = 0
+                            slow = False
                         else:
-                            w, r, fail, hold = adapt_actual_detail(
+                            w, r, fail, slow, hold = adapt_actual_detail(
                                 planned_w_at_the_time, planned_reps_detail, actual_detail,
-                                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail
+                                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow
                             )
                             w, r = apply_progress_modifiers(
                                 w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
@@ -2863,8 +2953,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         beginner = beginner and w > planned_w_at_the_time
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
-                    "beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
-                    (w, r[0], json.dumps(r), fail, int(beginner), progression_id)
+                    "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
+                    (w, r[0], json.dumps(r), fail, int(slow), int(beginner), progression_id)
                 )
                 conn.execute(
                     "DELETE FROM progression_sessions WHERE progression_id=? AND status='pending' AND session_index>=?",
@@ -2872,7 +2962,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r
+                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3011,7 +3101,7 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
             new_detail = [body.start_reps] * eff_sets
             conn.execute(
                 "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=0, "
-                "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                "is_slow_mode=0, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
                 (body.start_weight, body.start_reps, json.dumps(new_detail), int(body.beginner_mode), progression_id)
             )
             nxt = conn.execute(
@@ -3032,6 +3122,7 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
             conn.execute(
                 "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                 "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=0, fail_streakR=0, "
+                "is_slow_mode_l=0, is_slow_mode_r=0, "
                 "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
                 (body.start_weight, body.start_weight, json.dumps(new_detail), json.dumps(new_detail),
                  int(body.beginner_mode), progression_id)
@@ -3054,7 +3145,7 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
             new_detail = [body.start_reps] * eff_sets
             conn.execute(
                 "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=0, "
-                "beginner_mode=?, updated_at=datetime('now') WHERE id=?",
+                "is_slow_mode=0, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
                 (body.start_weight, body.start_reps, json.dumps(new_detail), int(body.beginner_mode), progression_id)
             )
             nxt = conn.execute(

@@ -529,34 +529,59 @@ def project_full_success(planned_reps_detail: list, actual_reps: list, high: int
 
 def generate_remaining_sessions(exercise_type, frequency, low, high, increment, sets_count,
                                  total_sessions, from_index, anchor_weight, anchor_reps_detail,
-                                 anchor_slow_mode: bool = False):
+                                 anchor_slow_mode: bool = False, achieved_weight=None, achieved_reps_detail=None):
     """
     Строит план сессий от from_index (включительно) до total_sessions, начиная с состояния
-    (anchor_weight, anchor_reps_detail) — цель ближайшей heavy/"стандартной" сессии, по подходам.
-    Роль каждого индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне (не сдвигается при
-    перегенерации), поэтому пересчёт с середины недели не путает фазу heavy/light.
-    Возвращает список кортежей (session_index, role, planned_weight, planned_reps_detail, planned_sets).
+    (anchor_weight, anchor_reps_detail) — цель БЛИЖАЙШЕЙ ЕЩЁ НЕ СЫГРАННОЙ heavy/"стандартной"
+    сессии, по подходам. Роль каждого индекса определяется его АБСОЛЮТНОЙ позицией в шаблоне
+    (не сдвигается при перегенерации), поэтому пересчёт с середины недели не путает фазу
+    heavy/light. Возвращает список кортежей
+    (session_index, role, planned_weight, planned_reps_detail, planned_sets).
 
-    План на сессии, которые ещё не наступили, — ОПТИМИСТИЧНЫЙ предпоказ: на каждой границе
-    шаблона (после heavy+все его light-дни) считается гипотеза "а если сыграть точно по плану" —
-    через ту же project_full_success, что и реальное логирование, поэтому предпоказ и то, что
-    реально произойдёт при точном попадании в план, ВСЕГДА совпадают. Расхождение возможно
-    только когда реальный факт отличается от плана — тогда после лога anchor пересчитывается
-    по-настоящему и предпоказ сессий впереди строится уже от новой точки.
+    achieved_weight/achieved_reps_detail — необязательная пара "что было РЕАЛЬНО показано" на
+    только что залогированной heavy-сессии (той, что идёт непосредственно перед from_index).
+    Нужна из-за light-дня: light всегда считается от уровня heavy ЭТОЙ ЖЕ недели (только что
+    сыгранной, ФАКТ), а не от anchor — anchor уже представляет ЦЕЛЬ СЛЕДУЮЩЕЙ heavy (climb уже
+    применён к нему в adapt_actual_detail). Если from_index указывает на light-день (первая
+    генерируемая сессия — не heavy), используем achieved для него и всех light-дней той же
+    недели; anchor (с climb) вступает в силу начиная со следующей heavy-границы. Если
+    achieved не передан (используется при создании/сбросе/новом цикле — там from_index сам
+    всегда heavy, light-соседей "с прошлой недели" ещё физически не было), поведение как раньше.
+
+    План на сессии, которые ещё не наступили, — ОПТИМИСТИЧНЫЙ предпоказ: на каждой heavy-границе
+    считается гипотеза "а если сыграть точно по плану" — через ту же project_full_success, что и
+    реальное логирование, поэтому предпоказ и то, что реально произойдёт при точном попадании в
+    план, ВСЕГДА совпадают. Расхождение возможно только когда реальный факт отличается от плана —
+    тогда после лога anchor пересчитывается по-настоящему и предпоказ сессий впереди строится уже
+    от новой точки.
     """
     template = role_template(exercise_type, frequency)
     freq = len(template)
-    w, reps_detail, slow = anchor_weight, list(anchor_reps_detail), anchor_slow_mode
+    first_phase = (from_index - 1) % freq
+    if achieved_reps_detail is not None and first_phase != 0:
+        # from_index стартует с light-дня той же недели, что и только что сыгранная heavy —
+        # используем факт этой heavy, climb ещё не наступил.
+        w, reps_detail, slow = achieved_weight, list(achieved_reps_detail), anchor_slow_mode
+        pending_climb = True  # climb (переход к anchor) применится на первой же heavy-границе
+    else:
+        w, reps_detail, slow = anchor_weight, list(anchor_reps_detail), anchor_slow_mode
+        pending_climb = False
     out = []
     for idx in range(from_index, total_sessions + 1):
         phase = (idx - 1) % freq
-        if idx > from_index and phase == 0:
-            if all(r >= high for r in reps_detail):
-                w = round_to_increment(w + increment, increment)
-                reps_detail = [low] * len(reps_detail)
-                slow = False
-            else:
-                reps_detail, slow = project_full_success(reps_detail, reps_detail, high, slow)
+        if phase == 0:
+            if pending_climb:
+                # Первая heavy-граница после light-дней "переходного" периода — здесь
+                # наконец вступает в силу anchor (climb уже посчитан заранее в adapt_actual_detail).
+                w, reps_detail, slow = anchor_weight, list(anchor_reps_detail), anchor_slow_mode
+                pending_climb = False
+            elif idx > from_index:
+                if all(r >= high for r in reps_detail):
+                    w = round_to_increment(w + increment, increment)
+                    reps_detail = [low] * len(reps_detail)
+                    slow = False
+                else:
+                    reps_detail, slow = project_full_success(reps_detail, reps_detail, high, slow)
         role = template[phase]
         if role in (None, "heavy"):
             out.append((idx, role, w, list(reps_detail), sets_count))
@@ -614,7 +639,7 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
 
     if all(actual_reps[i] >= planned_reps_detail[i] for i in range(n)):
         new_reps, new_slow = project_full_success(planned_reps_detail, actual_reps, high, prior_slow_mode)
-        return actual_weight, new_reps, 0, new_slow, True
+        return actual_weight, new_reps, 0, new_slow, "success"
 
     # Hold — план держится на месте по всем подходам, кроме последнего при провале:
     # тот понижается прямо до факта (см. docstring выше). Любой провал взводит slow_mode.
@@ -622,7 +647,7 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
     new_reps = list(planned_reps_detail)
     if actual_reps[last] < planned_reps_detail[last]:
         new_reps[last] = max(1, actual_reps[last])
-    return actual_weight, new_reps, 0, True, True
+    return actual_weight, new_reps, 0, True, "hold"
 
 
 
@@ -639,13 +664,19 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
 
 def _generate_uni_sessions(exercise_type, frequency, low, high, increment, sets_count,
                             total_sessions, from_index, wL, rL_detail, wR, rR_detail,
-                            slowL: bool = False, slowR: bool = False):
+                            slowL: bool = False, slowR: bool = False,
+                            achievedWL=None, achievedRL=None, achievedWR=None, achievedRR=None):
     """Прогоняет generate_remaining_sessions дважды (по разу на сторону, каждый раз с обычным
-    sets_count — без удвоения) и сшивает результат по индексу сессии в один plan на пару."""
+    sets_count — без удвоения) и сшивает результат по индексу сессии в один plan на пару.
+    achievedW*/achievedR* — то же самое "achieved" (факт только что сыгранной heavy, для
+    правильного расчёта ближайшего light-дня), но раздельно на каждую сторону — см.
+    generate_remaining_sessions."""
     left = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
-                                        sets_count, total_sessions, from_index, wL, rL_detail, slowL)
+                                        sets_count, total_sessions, from_index, wL, rL_detail, slowL,
+                                        achievedWL, achievedRL)
     right = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
-                                         sets_count, total_sessions, from_index, wR, rR_detail, slowR)
+                                         sets_count, total_sessions, from_index, wR, rR_detail, slowR,
+                                         achievedWR, achievedRR)
     return [(idx, role, wl, rl, wr, rr, sc) for (idx, role, wl, rl, sc), (_, _, wr, rr, _) in zip(left, right)]
 
 
@@ -738,7 +769,7 @@ def _unpack_unilateral_actual(actual_detail: list):
 # диапазона ещё раз". Hold и Step Down эти модификаторы не трогают вообще.
 
 def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, low, high, increment,
-                              rir, beginner_mode: bool, was_hold: bool = True):
+                              rir, beginner_mode: bool, outcome="success"):
     """beginner_mode — активен до первого исхода, который не Step Up.
 
     RIR-модификатор отключён полностью (см. историю бага): он вмешивался почти в
@@ -752,6 +783,12 @@ def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, low, h
     сохранности уже записанных значений actual_rir в БД, но здесь больше ни на
     что не влияет; RIR тестового подхода (start_rir, при создании прогрессии)
     эту функцию не затрагивает и продолжает работать как раньше.
+
+    outcome ("success" | "hold" | False) сюда передаётся, но сейчас не используется
+    внутри — оставлен для обратной совместимости мест вызова, которые полагаются на
+    него для другой цели (см. generate_remaining_sessions: значение "success"
+    сигнализирует вызывающему коду, что достигнутый факт отличается от новой,
+    уже climbed/catchup/miracle цели, и потому нужно передать achieved отдельно).
     """
     if new_weight <= planned_weight:
         return new_weight, new_reps_detail
@@ -2620,11 +2657,13 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
+                    achievedWL, achievedRL = (wL, actualRepsL) if hold_L == "success" else (None, None)
+                    achievedWR, achievedRR = (wR, actualRepsR) if hold_R == "success" else (None, None)
                     sessions = _generate_uni_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], sets_count, prog["total_sessions"],
                         session["session_index"] + 1, new_wL, new_rL, new_wR, new_rR,
-                        new_slowL, new_slowR
+                        new_slowL, new_slowR, achievedWL, achievedRL, achievedWR, achievedRR
                     )
                     _insert_uni_sessions(conn, progression_id, sessions, frequency=prog["frequency"],
                                           amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2671,10 +2710,11 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
+                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold == "success" else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r, new_slow
+                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2709,6 +2749,7 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     new_r = [prog["rep_range_low"]] * eff_sets
                     new_fail = 0
                     new_slow = False
+                    hold = False
                     still_beginner = was_beginner and new_w > session["planned_weight"]
                 else:
                     # Нейтральный исход AMRAP-теста (или это вообще не AMRAP-сессия) —
@@ -2734,10 +2775,11 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
+                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold == "success" else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r, new_slow
+                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2804,6 +2846,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 # по сторонам); неточность возможна только в редком случае отмены именно той
                 # сессии, которая сама выключила режим новичка.
                 beginner = bool(prog["beginner_mode"])
+                achievedWL = achievedRL = achievedWR = achievedRR = None
                 for s in sessions:
                     if s["session_index"] >= target["session_index"]:
                         break
@@ -2842,6 +2885,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             s["actual_rir"], beginner, holdR
                         )
                         beginner = beginner and wL > plannedWL_t and wR > plannedWR_t
+                        achievedWL, achievedRL = (wl_val, actualRepsL) if holdL == "success" else (None, None)
+                        achievedWR, achievedRR = (wr_val, actualRepsR) if holdR == "success" else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
@@ -2857,7 +2902,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 new_sessions = _generate_uni_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                     prog["increment"], sets_count, prog["total_sessions"], target["session_index"], wL, rL, wR, rR,
-                    slowL, slowR
+                    slowL, slowR, achievedWL, achievedRL, achievedWR, achievedRR
                 )
                 _insert_uni_sessions(conn, progression_id, new_sessions, frequency=prog["frequency"],
                                       amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2870,6 +2915,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 fail = 0
                 slow = False
                 beginner = bool(prog["beginner_mode"])
+                achieved_w, achieved_r = None, None
                 for s in sessions:
                     if s["session_index"] >= target["session_index"]:
                         break
@@ -2895,6 +2941,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             s["actual_rir"], beginner, hold
                         )
                         beginner = beginner and w > planned_w_at_the_time
+                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
@@ -2906,7 +2953,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow
+                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow,
+                    achieved_w, achieved_r
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2917,6 +2965,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 fail = 0
                 slow = False
                 beginner = bool(prog["beginner_mode"])
+                achieved_w, achieved_r = None, None
                 for s in sessions:
                     if s["session_index"] >= target["session_index"]:
                         break
@@ -2941,6 +2990,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             r = [prog["rep_range_low"]] * eff_sets
                             fail = 0
                             slow = False
+                            hold = False
                         else:
                             w, r, fail, slow, hold = adapt_actual_detail(
                                 planned_w_at_the_time, planned_reps_detail, actual_detail,
@@ -2951,6 +3001,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                                 s["actual_rir"], beginner, hold
                             )
                         beginner = beginner and w > planned_w_at_the_time
+                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
@@ -2962,7 +3013,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 )
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow
+                    prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow,
+                    achieved_w, achieved_r
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])

@@ -781,8 +781,13 @@ def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, low, h
     прошло по плану, — сильно раньше и чаще, чем должна расти прогрессия.
     Параметр rir оставлен в сигнатуре ради обратной совместимости вызовов и
     сохранности уже записанных значений actual_rir в БД, но здесь больше ни на
-    что не влияет; RIR тестового подхода (start_rir, при создании прогрессии)
-    эту функцию не затрагивает и продолжает работать как раньше.
+    что не влияет; RIR тестового подхода в мастере создания (расчёт стартового
+    веса по формуле Эпли) — отдельная, чисто клиентская величина, эту функцию
+    вообще не затрагивает. Отдельное поле "RIR" при задании стартовой точки
+    (start_rir) было убрано с фронта по той же причине, по которой убрали RIR
+    из логирования сессий: оно только записывалось в БД как метаданные для
+    текстового превью и никогда не участвовало ни в одном расчёте — то есть
+    визуально выглядело как настройка, но реально ни на что не влияло.
 
     outcome ("success" | "hold" | False) сюда передаётся, но сейчас не используется
     внутри — оставлен для обратной совместимости мест вызова, которые полагаются на
@@ -2394,7 +2399,7 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
                 "VALUES (?,?,?,'calculated','active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (pid, name, name_lc, body.exercise_type, body.goal, body.rep_unit,
                  body.rep_range_low, body.rep_range_high, body.frequency, body.sets_count,
-                 body.increment, body.start_weight, body.start_reps, body.start_rir,
+                 body.increment, body.start_weight, body.start_reps, None,
                  total_sessions, int(body.deload_enabled), int(body.unilateral),
                  uni_mode if body.unilateral else None, int(body.beginner_mode),
                  body.amrap_every_weeks, body.start_weight, body.start_reps,
@@ -2642,8 +2647,14 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     new_wR, new_rR, plannedWR, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                     body.actual_rir, was_beginner, hold_R
                 )
-                # режим новичка живёт до первого исхода НА ЛЮБОЙ стороне, который не Step Up
-                still_beginner = was_beginner and new_wL > plannedWL and new_wR > plannedWR
+                # Режим новичка живёт, пока обе стороны показывают идеальный результат:
+                # честный climb/miracle без буксования (success и не slow_mode) или настоящий
+                # Step Up (вес физически вырос). Первый же неидеальный исход на ЛЮБОЙ
+                # стороне (Hold, catch-up при уже включённом медленном режиме, Step Down) —
+                # выключает режим новичка навсегда для всей прогрессии.
+                clean_L = (new_wL > plannedWL) or (hold_L == "success" and not new_slowL)
+                clean_R = (new_wR > plannedWR) or (hold_R == "success" and not new_slowR)
+                still_beginner = was_beginner and clean_L and clean_R
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
@@ -2699,7 +2710,7 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                     body.actual_rir, was_beginner, hold
                 )
-                still_beginner = was_beginner and new_w > session["planned_weight"]
+                still_beginner = was_beginner and (new_w > session["planned_weight"] or (hold == "success" and not new_slow))
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
                     "fail_streak=?, is_slow_mode=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
@@ -2750,6 +2761,9 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     new_fail = 0
                     new_slow = False
                     hold = False
+                    # AMRAP-тест — отдельный решающий тест: явный прорыв (вес физически
+                    # вырос) трактуется как Step Up и оставляет режим новичка включённым;
+                    # просадка (вес не вырос) — неидеальный исход, выключает его.
                     still_beginner = was_beginner and new_w > session["planned_weight"]
                 else:
                     # Нейтральный исход AMRAP-теста (или это вообще не AMRAP-сессия) —
@@ -2764,7 +2778,10 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                         body.actual_rir, was_beginner, hold
                     )
                     # режим новичка живёт до первого исхода, который не Step Up (после модификаторов)
-                    still_beginner = was_beginner and new_w > session["planned_weight"]
+                    # режим новичка живёт, пока результат идеален: честный climb/miracle
+                    # без буксования (success и не slow_mode) или настоящий Step Up (вес
+                    # физически вырос) — первый же неидеальный исход выключает его навсегда.
+                    still_beginner = was_beginner and (new_w > session["planned_weight"] or (hold == "success" and not new_slow))
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, "
                     "fail_streak=?, is_slow_mode=?, beginner_mode=?, updated_at=datetime('now') WHERE id=?",
@@ -2884,7 +2901,12 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             wR, rR, plannedWR_t, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                             s["actual_rir"], beginner, holdR
                         )
-                        beginner = beginner and wL > plannedWL_t and wR > plannedWR_t
+                        # см. still_beginner в live-логировании — та же формула: остаётся
+                        # включённым, пока обе стороны идеальны (climb/miracle без буксования
+                        # или настоящий Step Up), выключается навсегда при первом отклонении.
+                        clean_L = (wL > plannedWL_t) or (holdL == "success" and not slowL)
+                        clean_R = (wR > plannedWR_t) or (holdR == "success" and not slowR)
+                        beginner = beginner and clean_L and clean_R
                         achievedWL, achievedRL = (wl_val, actualRepsL) if holdL == "success" else (None, None)
                         achievedWR, achievedRR = (wr_val, actualRepsR) if holdR == "success" else (None, None)
                 conn.execute(
@@ -2940,7 +2962,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                             s["actual_rir"], beginner, hold
                         )
-                        beginner = beginner and w > planned_w_at_the_time
+                        beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
                         achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
@@ -3000,7 +3022,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                                 w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
                                 s["actual_rir"], beginner, hold
                             )
-                        beginner = beginner and w > planned_w_at_the_time
+                        beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
                         achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "

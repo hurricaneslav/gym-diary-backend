@@ -534,7 +534,8 @@ def project_full_success(planned_reps_detail: list, actual_reps: list, high: int
 
 def generate_remaining_sessions(exercise_type, frequency, low, high, increment, sets_count,
                                  total_sessions, from_index, anchor_weight, anchor_reps_detail,
-                                 anchor_slow_mode: bool = False, achieved_weight=None, achieved_reps_detail=None):
+                                 anchor_slow_mode: bool = False, achieved_weight=None, achieved_reps_detail=None,
+                                 climb_step: int = 1):
     """
     Строит план сессий от from_index (включительно) до total_sessions, начиная с состояния
     (anchor_weight, anchor_reps_detail) — цель БЛИЖАЙШЕЙ ЕЩЁ НЕ СЫГРАННОЙ heavy/"стандартной"
@@ -543,11 +544,19 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
     heavy/light. Возвращает список кортежей
     (session_index, role, planned_weight, planned_reps_detail, planned_sets).
 
-    achieved_weight/achieved_reps_detail — необязательная пара "что было РЕАЛЬНО показано" на
-    только что залогированной heavy-сессии (той, что идёт непосредственно перед from_index).
-    Нужна из-за light-дня: light всегда считается от уровня heavy ЭТОЙ ЖЕ недели (только что
-    сыгранной, ФАКТ), а не от anchor — anchor уже представляет ЦЕЛЬ СЛЕДУЮЩЕЙ heavy (climb уже
-    применён к нему в adapt_actual_detail). Если from_index указывает на light-день (первая
+    climb_step — см. project_full_success/adapt_actual_detail: пока активен режим новичка,
+    оптимистичный предпоказ будущих heavy-границ должен расти на 2 повтора за шаг, а не на 1
+    (см. историю бага — раньше предпоказ всегда использовал climb_step=1 независимо от
+    режима новичка, поэтому реальный лог "точно по плану" при активном режиме новичка
+    внезапно скакал сильнее, чем показывал предпоказ до этого).
+
+    achieved_weight/achieved_reps_detail — необязательная пара "старый план ПЕРВОГО (ведущего)
+    подхода только что сыгранной heavy-сессии этой же недели" (см. историю бага — раньше сюда
+    передавался ФАКТ, что давало light-дню бонус от чужого перевыполнения; теперь всегда
+    старый план ведущего подхода, при точном совпадении с планом факт=план и разницы нет).
+    Нужна из-за light-дня: light всегда считается от уровня heavy ЭТОЙ ЖЕ недели (по старому
+    плану ведущего подхода, без учёта climb/catch-up/чуда — те уже применены к anchor, но
+    anchor представляет ЦЕЛЬ СЛЕДУЮЩЕЙ heavy). Если from_index указывает на light-день (первая
     генерируемая сессия — не heavy), используем achieved для него и всех light-дней той же
     недели; anchor (с climb) вступает в силу начиная со следующей heavy-границы. Если
     achieved не передан (используется при создании/сбросе/новом цикле — там from_index сам
@@ -586,7 +595,7 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
                     reps_detail = [low] * len(reps_detail)
                     slow = False
                 else:
-                    reps_detail, slow = project_full_success(reps_detail, reps_detail, high, slow)
+                    reps_detail, slow = project_full_success(reps_detail, reps_detail, high, slow, climb_step)
         role = template[phase]
         if role in (None, "heavy"):
             out.append((idx, role, w, list(reps_detail), sets_count))
@@ -675,18 +684,20 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
 def _generate_uni_sessions(exercise_type, frequency, low, high, increment, sets_count,
                             total_sessions, from_index, wL, rL_detail, wR, rR_detail,
                             slowL: bool = False, slowR: bool = False,
-                            achievedWL=None, achievedRL=None, achievedWR=None, achievedRR=None):
+                            achievedWL=None, achievedRL=None, achievedWR=None, achievedRR=None,
+                            climb_step: int = 1):
     """Прогоняет generate_remaining_sessions дважды (по разу на сторону, каждый раз с обычным
     sets_count — без удвоения) и сшивает результат по индексу сессии в один plan на пару.
-    achievedW*/achievedR* — то же самое "achieved" (факт только что сыгранной heavy, для
-    правильного расчёта ближайшего light-дня), но раздельно на каждую сторону — см.
-    generate_remaining_sessions."""
+    achievedW*/achievedR* — то же самое "achieved" (старый план ведущего подхода только что
+    сыгранной heavy, для правильного расчёта ближайшего light-дня), но раздельно на каждую
+    сторону — см. generate_remaining_sessions. climb_step — см. generate_remaining_sessions,
+    общий на обе стороны (beginner_mode — свойство всей прогрессии, не отдельной стороны)."""
     left = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
                                         sets_count, total_sessions, from_index, wL, rL_detail, slowL,
-                                        achievedWL, achievedRL)
+                                        achievedWL, achievedRL, climb_step)
     right = generate_remaining_sessions(exercise_type, frequency, low, high, increment,
                                          sets_count, total_sessions, from_index, wR, rR_detail, slowR,
-                                         achievedWR, achievedRR)
+                                         achievedWR, achievedRR, climb_step)
     return [(idx, role, wl, rl, wr, rr, sc) for (idx, role, wl, rl, sc), (_, _, wr, rr, _) in zip(left, right)]
 
 
@@ -2249,7 +2260,7 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         sessions = generate_remaining_sessions(
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
             eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail,
-            bool(prog["is_slow_mode"])
+            bool(prog["is_slow_mode"]), climb_step=2 if prog["beginner_mode"] else 1
         )
         _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                           frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2259,7 +2270,7 @@ def _maybe_complete_or_topup(conn, progression_id: int):
         sessions = generate_remaining_sessions(
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
             eff_sets, new_total, prog["total_sessions"] + 1, prog["current_weight"], detail,
-            bool(prog["is_slow_mode"])
+            bool(prog["is_slow_mode"]), climb_step=2 if prog["beginner_mode"] else 1
         )
         _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                           frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2271,7 +2282,8 @@ def _maybe_complete_or_topup(conn, progression_id: int):
             prog["exercise_type"], freq, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
             sets_count, new_total, prog["total_sessions"] + 1,
             prog["current_weightL"], rL, prog["current_weightR"], rR,
-            bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"])
+            bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"]),
+            climb_step=2 if prog["beginner_mode"] else 1
         )
         _insert_uni_sessions(conn, progression_id, sessions, frequency=freq, amrap_every_weeks=prog["amrap_every_weeks"])
     conn.execute("UPDATE progressions SET total_sessions=? WHERE id=?", (new_total, progression_id))
@@ -2426,7 +2438,8 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
         if not body.unilateral:
             sessions = generate_remaining_sessions(
                 body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
-                body.increment, body.sets_count, total_sessions, 1, body.start_weight, start_reps_detail
+                body.increment, body.sets_count, total_sessions, 1, body.start_weight, start_reps_detail,
+                climb_step=2 if body.beginner_mode else 1
             )
             _insert_sessions(conn, new_id, sessions, unilateral=False, display_sets_count=body.sets_count,
                               frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
@@ -2436,7 +2449,8 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             # где важна симметрия, а не максимум силы каждой стороны по отдельности.
             sessions = generate_remaining_sessions(
                 body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
-                body.increment, eff_sets_equalize, total_sessions, 1, body.start_weight, start_reps_detail_equalize
+                body.increment, eff_sets_equalize, total_sessions, 1, body.start_weight, start_reps_detail_equalize,
+                climb_step=2 if body.beginner_mode else 1
             )
             _insert_sessions(conn, new_id, sessions, unilateral=True, display_sets_count=body.sets_count,
                               frequency=body.frequency, amrap_every_weeks=body.amrap_every_weeks)
@@ -2446,7 +2460,8 @@ def create_progression(body: ProgressionCreateIn, x_init_data: str = Header(...)
             sessions = _generate_uni_sessions(
                 body.exercise_type, body.frequency, body.rep_range_low, body.rep_range_high,
                 body.increment, body.sets_count, total_sessions, 1,
-                body.start_weight, start_reps_detail, body.start_weight, list(start_reps_detail)
+                body.start_weight, start_reps_detail, body.start_weight, list(start_reps_detail),
+                climb_step=2 if body.beginner_mode else 1
             )
             _insert_uni_sessions(conn, new_id, sessions, frequency=body.frequency,
                                   amrap_every_weeks=body.amrap_every_weeks)
@@ -2520,7 +2535,8 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 )
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], frequency, low, high, increment, sets_count,
-                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"])
+                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"]),
+                    climb_step=2 if prog["beginner_mode"] else 1
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=sets_count,
                                   frequency=frequency, amrap_every_weeks=amrap_weeks)
@@ -2539,7 +2555,8 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 )
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], frequency, low, high, increment, eff_sets,
-                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"])
+                    prog["total_sessions"], nxt, cw, detail, bool(prog["is_slow_mode"]),
+                    climb_step=2 if prog["beginner_mode"] else 1
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=sets_count,
                                   frequency=frequency, amrap_every_weeks=amrap_weeks)
@@ -2560,7 +2577,8 @@ def edit_progression(progression_id: int, body: ProgressionEditIn, x_init_data: 
                 sessions = _generate_uni_sessions(
                     prog["exercise_type"], frequency, low, high, increment, sets_count,
                     prog["total_sessions"], nxt, cwL, rL, cwR, rR,
-                    bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"])
+                    bool(prog["is_slow_mode_l"]), bool(prog["is_slow_mode_r"]),
+                    climb_step=2 if prog["beginner_mode"] else 1
                 )
                 _insert_uni_sessions(conn, progression_id, sessions, frequency=frequency, amrap_every_weeks=amrap_weeks)
     return {"ok": True}
@@ -2673,16 +2691,20 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
-                    # achieved передаётся и на "stepup", не только на "success" — так ближайший
-                    # ещё не сыгранный light-день этой же недели остаётся на СТАРОМ весе/повторах,
-                    # а Step UP вступает в силу только с следующей heavy-границы (см. историю бага).
-                    achievedWL, achievedRL = (wL, actualRepsL) if hold_L in ("success", "stepup") else (None, None)
-                    achievedWR, achievedRR = (wR, actualRepsR) if hold_R in ("success", "stepup") else (None, None)
+                    # achieved теперь ВСЕГДА старый план ведущего подхода (не факт!) — см. историю
+                    # бага: раньше сюда передавался факт, из-за чего лёгкий день этой же недели
+                    # получал "бонус" от любого перевыполнения heavy-сессии (план 5,5,5 факт 5,5,6
+                    # давал light [4,4,5] вместо правильных [4,4,4]). При точном совпадении план==факт,
+                    # разницы нет; передаётся и на "stepup" — так лёгкий день остаётся на СТАРОМ
+                    # весе/повторах, а Step UP вступает в силу только с следующей heavy-границы.
+                    achievedWL, achievedRL = (plannedWL, plannedL) if hold_L in ("success", "stepup") else (None, None)
+                    achievedWR, achievedRR = (plannedWR, plannedR) if hold_R in ("success", "stepup") else (None, None)
                     sessions = _generate_uni_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], sets_count, prog["total_sessions"],
                         session["session_index"] + 1, new_wL, new_rL, new_wR, new_rR,
-                        new_slowL, new_slowR, achievedWL, achievedRL, achievedWR, achievedRR
+                        new_slowL, new_slowR, achievedWL, achievedRL, achievedWR, achievedRR,
+                        2 if still_beginner else 1
                     )
                     _insert_uni_sessions(conn, progression_id, sessions, frequency=prog["frequency"],
                                           amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2726,12 +2748,14 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
-                    # achieved и на "stepup" — см. комментарий в unilateral independent блоке выше.
-                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold in ("success", "stepup") else (None, None)
+                    # achieved теперь старый план ведущего подхода (см. комментарий выше) — берём
+                    # planned_reps_detail (то, что было до сессии), не actual_detail (факт).
+                    achieved_w, achieved_r = (session["planned_weight"], planned_reps_detail) if hold in ("success", "stepup") else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r
+                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r,
+                        2 if still_beginner else 1
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2799,12 +2823,15 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     # heavy-границы, ближайший light остаётся на старом весе). AMRAP-прорыв/
                     # просадка (hold=False здесь) — намеренно НЕ передаёт achieved: это особый
                     # случай, амраповский пересчёт веса вступает в силу сразу же, в т.ч. для
-                    # ближайшего light-дня (см. историю уточнений с пользователем).
-                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold in ("success", "stepup") else (None, None)
+                    # ближайшего light-дня (см. историю уточнений с пользователем). achieved —
+                    # старый план ведущего подхода (planned_reps_detail), не факт — см. комментарий
+                    # в equalize-блоке выше (иначе light получает бонус от чужого перевыполнения).
+                    achieved_w, achieved_r = (session["planned_weight"], planned_reps_detail) if hold in ("success", "stepup") else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
-                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r
+                        session["session_index"] + 1, new_w, new_r, new_slow, achieved_w, achieved_r,
+                        2 if still_beginner else 1
                     )
                     _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                       frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2908,9 +2935,10 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         clean_L = (wL > plannedWL_t) or (holdL == "success" and not slowL)
                         clean_R = (wR > plannedWR_t) or (holdR == "success" and not slowR)
                         beginner = beginner and clean_L and clean_R
-                        # achieved и на "stepup" — см. комментарий в live-логировании выше.
-                        achievedWL, achievedRL = (wl_val, actualRepsL) if holdL in ("success", "stepup") else (None, None)
-                        achievedWR, achievedRR = (wr_val, actualRepsR) if holdR in ("success", "stepup") else (None, None)
+                        # achieved — старый план ведущего подхода (не факт), см. комментарий
+                        # в live-логировании выше; передаётся и на "stepup".
+                        achievedWL, achievedRL = (plannedWL_t, plannedL) if holdL in ("success", "stepup") else (None, None)
+                        achievedWR, achievedRR = (plannedWR_t, plannedR) if holdR in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
@@ -2926,7 +2954,8 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 new_sessions = _generate_uni_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                     prog["increment"], sets_count, prog["total_sessions"], target["session_index"], wL, rL, wR, rR,
-                    slowL, slowR, achievedWL, achievedRL, achievedWR, achievedRR
+                    slowL, slowR, achievedWL, achievedRL, achievedWR, achievedRR,
+                    climb_step=2 if beginner else 1
                 )
                 _insert_uni_sessions(conn, progression_id, new_sessions, frequency=prog["frequency"],
                                       amrap_every_weeks=prog["amrap_every_weeks"])
@@ -2962,8 +2991,9 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow, climb_step
                         )
                         beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
-                        # achieved и на "stepup" — см. комментарий в live-логировании выше.
-                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold in ("success", "stepup") else (None, None)
+                        # achieved — старый план ведущего подхода (planned_reps_detail[0]),
+                        # см. комментарий в live-логировании выше; передаётся и на "stepup".
+                        achieved_w, achieved_r = (planned_w_at_the_time, planned_reps_detail) if hold in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
@@ -2976,7 +3006,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                     prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow,
-                    achieved_w, achieved_r
+                    achieved_w, achieved_r, climb_step=2 if beginner else 1
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3020,9 +3050,9 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                                 prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow, climb_step
                             )
                         beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
-                        # achieved и на "stepup" (обычный Step UP); AMRAP-пересчёт (hold=False
+                        # achieved — старый план ведущего подхода; AMRAP-пересчёт (hold=False
                         # здесь) намеренно НЕ передаёт achieved — см. комментарий в live-логировании.
-                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold in ("success", "stepup") else (None, None)
+                        achieved_w, achieved_r = (planned_w_at_the_time, planned_reps_detail) if hold in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
@@ -3035,7 +3065,7 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                 new_sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                     prog["increment"], eff_sets, prog["total_sessions"], target["session_index"], w, r, slow,
-                    achieved_w, achieved_r
+                    achieved_w, achieved_r, climb_step=2 if beginner else 1
                 )
                 _insert_sessions(conn, progression_id, new_sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3090,7 +3120,8 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
                 raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
             new_id = cur.lastrowid
             sessions = generate_remaining_sessions(
-                prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail
+                prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail,
+                climb_step=2 if prog["beginner_mode"] else 1
             )
             _insert_sessions(conn, new_id, sessions, unilateral=False, display_sets_count=sets_count,
                               frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3118,7 +3149,8 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
                 raise HTTPException(409, "У этого упражнения уже есть активная прогрессия")
             new_id = cur.lastrowid
             sessions = generate_remaining_sessions(
-                prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail
+                prog["exercise_type"], frequency, low, high, increment, eff_sets, total_sessions, 1, start_w, start_r_detail,
+                climb_step=2 if prog["beginner_mode"] else 1
             )
             _insert_sessions(conn, new_id, sessions, unilateral=True, display_sets_count=sets_count,
                               frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3151,7 +3183,7 @@ def new_progression_cycle(progression_id: int, body: NewCycleIn, x_init_data: st
             new_id = cur.lastrowid
             sessions = _generate_uni_sessions(
                 prog["exercise_type"], frequency, low, high, increment, sets_count, total_sessions, 1,
-                start_wL, rL, start_wR, rR
+                start_wL, rL, start_wR, rR, climb_step=2 if prog["beginner_mode"] else 1
             )
             _insert_uni_sessions(conn, new_id, sessions, frequency=frequency, amrap_every_weeks=prog["amrap_every_weeks"])
     return {"ok": True, "id": new_id}
@@ -3185,7 +3217,8 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
                 conn.execute("DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,))
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail
+                    prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail,
+                    climb_step=2 if body.beginner_mode else 1
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=True, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3209,7 +3242,8 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
                 sessions = _generate_uni_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                     prog["increment"], sets_count, prog["total_sessions"], nxt,
-                    body.start_weight, new_detail, body.start_weight, list(new_detail)
+                    body.start_weight, new_detail, body.start_weight, list(new_detail),
+                    climb_step=2 if body.beginner_mode else 1
                 )
                 _insert_uni_sessions(conn, progression_id, sessions, frequency=prog["frequency"],
                                       amrap_every_weeks=prog["amrap_every_weeks"])
@@ -3229,7 +3263,8 @@ def reset_progression_start(progression_id: int, body: ResetStartIn, x_init_data
                 conn.execute("DELETE FROM progression_sessions WHERE progression_id=? AND status='pending'", (progression_id,))
                 sessions = generate_remaining_sessions(
                     prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
-                    prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail
+                    prog["increment"], eff_sets, prog["total_sessions"], nxt, body.start_weight, new_detail,
+                    climb_step=2 if body.beginner_mode else 1
                 )
                 _insert_sessions(conn, progression_id, sessions, unilateral=False, display_sets_count=prog["sets_count"],
                                   frequency=prog["frequency"], amrap_every_weeks=prog["amrap_every_weeks"])

@@ -467,7 +467,8 @@ def normalize_range_detail(weight: float, reps_detail: list, low: int, high: int
     return weight, [min(high, max(low, int(r))) for r in reps_detail]
 
 
-def project_full_success(planned_reps_detail: list, actual_reps: list, high: int, prior_slow_mode: bool):
+def project_full_success(planned_reps_detail: list, actual_reps: list, high: int, prior_slow_mode: bool,
+                          climb_step: int = 1):
     """
     Единая логика "что происходит с целью по повторам, когда сессия полностью выполнена"
     (все подходы >= своего плана, но не все ещё на потолке диапазона — Step UP уже
@@ -478,51 +479,58 @@ def project_full_success(planned_reps_detail: list, actual_reps: list, high: int
     иначе предпоказ будущих сессий разойдётся с тем, что реально произойдёт при точном
     попадании в план (см. историю бага).
 
+    climb_step — на сколько повторов растёт цель за один шаг climb/catch-up/чудо (обычно 1;
+    режим новичка теперь ускоряет НАБОР ПОВТОРОВ, а не скачок веса — см. историю бага и
+    apply_progress_modifiers — поэтому вызывающий код передаёт 2, пока активен beginner_mode).
+
     Адаптивная скорость прогрессии — три случая:
 
     1) "Чудо" — какой-то подход показал результат СВЕРХ своего плана (например план был
-       неровным после подтягивания, а человек взял и перевыполнил). Это самый сильный сигнал:
-       прогрессия сразу возвращается на быструю скорость (slow_mode сбрасывается), новая цель
-       каждого подхода — его собственный факт +1, но не выше нового уровня первого/ведущего
-       подхода (+1 от его факта) — ведущий подход остаётся потолком новой цели, даже если
-       фактически кто-то поднял больше него.
+       неровным после подтягивания, а человек взял и перевыполнил, или прогресс случился на
+       непервом подходе). Это самый сильный сигнал: прогрессия сразу возвращается на быструю
+       скорость (slow_mode сбрасывается). Новая цель ВСЕГДА переносится на ПЕРВЫЙ (ведущий)
+       подход — он растёт на climb_step от своего СТАРОГО ПЛАНА (не от факта — чудо может
+       случиться на любом подходе, а прогрессировать "с нагруженного", то есть уставшего,
+       конца сессии нелогично), остальные подходы остаются на прежнем уровне плана.
+       Например план 6,6,6 факт 6,6,8 -> новая цель 7,6,6 (не 9,9,9 и не 6,6,9).
 
     2) План уже был РОВНЫЙ (все подходы на одном уровне) и это не "быстрый" режим замедления
-       (prior_slow_mode=False) — классическая двойная прогрессия: ВСЕ подходы растут на +1
-       вместе.
+       (prior_slow_mode=False) — классическая двойная прогрессия: ВСЕ подходы растут на
+       climb_step вместе.
 
     3) Иначе (план был неровный — кто-то отстаёт — ЛИБО мы уже в медленном режиме после
        недавнего провала, даже если план успел снова выровняться и это выполнено ровно как
        по плану) — осторожная скорость: если план ещё неровный, подтягиваем ОДИН отстающий
-       подход (по порядку) на +1 к уровню ведущего, не выше него; если план уже ровный (мы в
-       медленном режиме, но отстающие уже все подтянулись) — растёт только ведущий (первый)
-       подход, остальные ждут, когда прогрессия снова его нагонит. В обоих случаях slow_mode
-       остаётся включённым — вернуться к быстрой скорости можно только через "чудо" (случай 1).
+       подход (по порядку) на climb_step к уровню ведущего, не выше него; если план уже ровный
+       (мы в медленном режиме, но отстающие уже все подтянулись) — растёт только ведущий
+       (первый) подход на climb_step, остальные ждут, когда прогрессия снова его нагонит. В
+       обоих случаях slow_mode остаётся включённым — вернуться к быстрой скорости можно только
+       через "чудо" (случай 1).
 
     Возвращает (new_reps_detail, new_slow_mode).
     """
     n = len(planned_reps_detail)
     overperformed = any(actual_reps[i] > planned_reps_detail[i] for i in range(n))
     if overperformed:
-        new_leader = min(high, actual_reps[0] + 1)
-        new_reps = [min(high, min(a + 1, new_leader)) for a in actual_reps]
+        new_reps = list(planned_reps_detail)
+        new_reps[0] = min(high, planned_reps_detail[0] + climb_step)
         return new_reps, False
 
     leader = planned_reps_detail[0]
     uniform_plan = all(p == leader for p in planned_reps_detail)
 
     if uniform_plan and not prior_slow_mode:
-        return [min(high, p + 1) for p in planned_reps_detail], False
+        return [min(high, p + climb_step) for p in planned_reps_detail], False
 
     if uniform_plan:
         new_reps = list(planned_reps_detail)
-        new_reps[0] = min(high, leader + 1)
+        new_reps[0] = min(high, leader + climb_step)
         return new_reps, True
 
     new_reps = list(planned_reps_detail)
     for i in range(1, n):
         if new_reps[i] < leader:
-            new_reps[i] = min(leader, new_reps[i] + 1)
+            new_reps[i] = min(leader, new_reps[i] + climb_step)
             break
     return new_reps, True
 
@@ -592,11 +600,16 @@ def generate_remaining_sessions(exercise_type, frequency, low, high, increment, 
 
 
 def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list,
-                         low, high, increment, prior_fail_streak: int, prior_slow_mode: bool = False):
+                         low, high, increment, prior_fail_streak: int, prior_slow_mode: bool = False,
+                         climb_step: int = 1):
     """
     По факту одной heavy/"стандартной" сессии решает новую точку (anchor_weight,
     anchor_reps_detail), новый fail_streak и новый slow_mode (адаптивная скорость
     прогрессии — см. project_full_success).
+
+    climb_step — см. project_full_success; при активном режиме новичка цель растёт на 2
+    повтора за шаг вместо 1 (раньше режим новичка удваивал скачок ВЕСА на Step UP — это
+    убрано, см. историю бага и apply_progress_modifiers, вес больше не удваивается).
 
     Step UP:   ВСЕ рабочие подходы достигли верха диапазона → вес +increment,
                повторы всех подходов — к низу нового диапазона, slow_mode сбрасывается
@@ -635,10 +648,10 @@ def adapt_actual_detail(planned_weight, planned_reps_detail, actual_detail: list
         return planned_weight, planned_reps_detail, prior_fail_streak + 1, True, False
 
     if all(r >= high for r in actual_reps):
-        return round_to_increment(actual_weight + increment, increment), [low] * n, 0, False, False
+        return round_to_increment(actual_weight + increment, increment), [low] * n, 0, False, "stepup"
 
     if all(actual_reps[i] >= planned_reps_detail[i] for i in range(n)):
-        new_reps, new_slow = project_full_success(planned_reps_detail, actual_reps, high, prior_slow_mode)
+        new_reps, new_slow = project_full_success(planned_reps_detail, actual_reps, high, prior_slow_mode, climb_step)
         return actual_weight, new_reps, 0, new_slow, "success"
 
     # Hold — план держится на месте по всем подходам, кроме последнего при провале:
@@ -789,18 +802,20 @@ def apply_progress_modifiers(new_weight, new_reps_detail, planned_weight, low, h
     текстового превью и никогда не участвовало ни в одном расчёте — то есть
     визуально выглядело как настройка, но реально ни на что не влияло.
 
-    outcome ("success" | "hold" | False) сюда передаётся, но сейчас не используется
+    Режим новичка БОЛЬШЕ НЕ удваивает скачок веса на Step UP (см. историю бага —
+    пользователь счёл это слишком резким скачком, "50x5 -> сразу 55x5, минуя весь
+    диапазон"). Вместо этого он ускоряет НАБОР ПОВТОРОВ между сессиями — climb_step=2
+    вместо 1, см. project_full_success/adapt_actual_detail, куда это передаётся ДО
+    вызова этой функции. Здесь вес больше не модифицируется вообще — функция оставлена
+    как проходной no-op ради обратной совместимости мест вызова.
+
+    outcome ("success" | "hold" | "stepup" | False) сюда передаётся, но не используется
     внутри — оставлен для обратной совместимости мест вызова, которые полагаются на
-    него для другой цели (см. generate_remaining_sessions: значение "success"
-    сигнализирует вызывающему коду, что достигнутый факт отличается от новой,
-    уже climbed/catchup/miracle цели, и потому нужно передать achieved отдельно).
+    него для другой цели (см. generate_remaining_sessions: значения "success"/"stepup"
+    сигнализируют вызывающему коду, что достигнутый факт отличается от новой, уже
+    climbed/catchup/miracle/выросшей-в-весе цели, и потому нужно передать achieved
+    отдельно для ближайшего ещё не сыгранного light-дня той же недели).
     """
-    if new_weight <= planned_weight:
-        return new_weight, new_reps_detail
-    step = new_weight - planned_weight
-    if beginner_mode:
-        step *= 2
-        new_weight = round_to_increment(planned_weight + step, increment)
     return new_weight, new_reps_detail
 
 
@@ -2629,23 +2644,16 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 actual_detailL = [{"weight": wL, "reps": r} for r in actualRepsL]
                 actual_detailR = [{"weight": wR, "reps": r} for r in actualRepsR]
 
+                climb_step = 2 if was_beginner else 1
                 new_wL, new_rL, new_failL, new_slowL, hold_L = adapt_actual_detail(
                     plannedWL, plannedL, actual_detailL,
                     prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakL"],
-                    bool(prog["is_slow_mode_l"])
-                )
-                new_wL, new_rL = apply_progress_modifiers(
-                    new_wL, new_rL, plannedWL, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                    body.actual_rir, was_beginner, hold_L
+                    bool(prog["is_slow_mode_l"]), climb_step
                 )
                 new_wR, new_rR, new_failR, new_slowR, hold_R = adapt_actual_detail(
                     plannedWR, plannedR, actual_detailR,
                     prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streakR"],
-                    bool(prog["is_slow_mode_r"])
-                )
-                new_wR, new_rR = apply_progress_modifiers(
-                    new_wR, new_rR, plannedWR, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                    body.actual_rir, was_beginner, hold_R
+                    bool(prog["is_slow_mode_r"]), climb_step
                 )
                 # Режим новичка живёт, пока обе стороны показывают идеальный результат:
                 # честный climb/miracle без буксования (success и не slow_mode) или настоящий
@@ -2668,8 +2676,11 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
-                    achievedWL, achievedRL = (wL, actualRepsL) if hold_L == "success" else (None, None)
-                    achievedWR, achievedRR = (wR, actualRepsR) if hold_R == "success" else (None, None)
+                    # achieved передаётся и на "stepup", не только на "success" — так ближайший
+                    # ещё не сыгранный light-день этой же недели остаётся на СТАРОМ весе/повторах,
+                    # а Step UP вступает в силу только с следующей heavy-границы (см. историю бага).
+                    achievedWL, achievedRL = (wL, actualRepsL) if hold_L in ("success", "stepup") else (None, None)
+                    achievedWR, achievedRR = (wR, actualRepsR) if hold_R in ("success", "stepup") else (None, None)
                     sessions = _generate_uni_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], sets_count, prog["total_sessions"],
@@ -2701,14 +2712,11 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     actual_detail = [{"weight": body.actual_weight, "reps": body.actual_reps}] * (body.actual_sets or 1)
                     actual_detail = actual_detail * 2
 
+                climb_step = 2 if was_beginner else 1
                 new_w, new_r, new_fail, new_slow, hold = adapt_actual_detail(
                     session["planned_weight"], planned_reps_detail, actual_detail,
                     prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"],
-                    bool(prog["is_slow_mode"])
-                )
-                new_w, new_r = apply_progress_modifiers(
-                    new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                    body.actual_rir, was_beginner, hold
+                    bool(prog["is_slow_mode"]), climb_step
                 )
                 still_beginner = was_beginner and (new_w > session["planned_weight"] or (hold == "success" and not new_slow))
                 conn.execute(
@@ -2721,7 +2729,8 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
-                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold == "success" else (None, None)
+                    # achieved и на "stepup" — см. комментарий в unilateral independent блоке выше.
+                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold in ("success", "stepup") else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
@@ -2768,14 +2777,11 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                 else:
                     # Нейтральный исход AMRAP-теста (или это вообще не AMRAP-сессия) —
                     # обычная двойная прогрессия по подходам, как для рядовой сессии.
+                    climb_step = 2 if was_beginner else 1
                     new_w, new_r, new_fail, new_slow, hold = adapt_actual_detail(
                         session["planned_weight"], planned_reps_detail, actual_detail,
                         prog["rep_range_low"], prog["rep_range_high"], prog["increment"], prog["fail_streak"],
-                        bool(prog["is_slow_mode"])
-                    )
-                    new_w, new_r = apply_progress_modifiers(
-                        new_w, new_r, session["planned_weight"], prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                        body.actual_rir, was_beginner, hold
+                        bool(prog["is_slow_mode"]), climb_step
                     )
                     # режим новичка живёт до первого исхода, который не Step Up (после модификаторов)
                     # режим новичка живёт, пока результат идеален: честный climb/miracle
@@ -2792,7 +2798,12 @@ def log_progression_session(progression_id: int, session_id: int, body: SessionL
                     (progression_id, session["session_index"])
                 )
                 if session["session_index"] < prog["total_sessions"]:
-                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold == "success" else (None, None)
+                    # achieved и на "stepup" (обычный Step UP — откладываем его до следующей
+                    # heavy-границы, ближайший light остаётся на старом весе). AMRAP-прорыв/
+                    # просадка (hold=False здесь) — намеренно НЕ передаёт achieved: это особый
+                    # случай, амраповский пересчёт веса вступает в силу сразу же, в т.ч. для
+                    # ближайшего light-дня (см. историю уточнений с пользователем).
+                    achieved_w, achieved_r = (actual_detail[0]["weight"], [int(s["reps"]) for s in actual_detail]) if hold in ("success", "stepup") else (None, None)
                     sessions = generate_remaining_sessions(
                         prog["exercise_type"], prog["frequency"], prog["rep_range_low"], prog["rep_range_high"],
                         prog["increment"], eff_sets, prog["total_sessions"],
@@ -2885,21 +2896,14 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         actual_detailL = [{"weight": wl_val, "reps": r} for r in actualRepsL]
                         actual_detailR = [{"weight": wr_val, "reps": r} for r in actualRepsR]
 
+                        climb_step = 2 if beginner else 1
                         wL, rL, failL, slowL, holdL = adapt_actual_detail(
                             plannedWL_t, plannedL, actual_detailL,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failL, slowL
-                        )
-                        wL, rL = apply_progress_modifiers(
-                            wL, rL, plannedWL_t, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                            s["actual_rir"], beginner, holdL
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failL, slowL, climb_step
                         )
                         wR, rR, failR, slowR, holdR = adapt_actual_detail(
                             plannedWR_t, plannedR, actual_detailR,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failR, slowR
-                        )
-                        wR, rR = apply_progress_modifiers(
-                            wR, rR, plannedWR_t, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                            s["actual_rir"], beginner, holdR
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], failR, slowR, climb_step
                         )
                         # см. still_beginner в live-логировании — та же формула: остаётся
                         # включённым, пока обе стороны идеальны (climb/miracle без буксования
@@ -2907,8 +2911,9 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                         clean_L = (wL > plannedWL_t) or (holdL == "success" and not slowL)
                         clean_R = (wR > plannedWR_t) or (holdR == "success" and not slowR)
                         beginner = beginner and clean_L and clean_R
-                        achievedWL, achievedRL = (wl_val, actualRepsL) if holdL == "success" else (None, None)
-                        achievedWR, achievedRR = (wr_val, actualRepsR) if holdR == "success" else (None, None)
+                        # achieved и на "stepup" — см. комментарий в live-логировании выше.
+                        achievedWL, achievedRL = (wl_val, actualRepsL) if holdL in ("success", "stepup") else (None, None)
+                        achievedWR, achievedRR = (wr_val, actualRepsR) if holdR in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weightL=?, current_weightR=?, "
                     "current_reps_detailL=?, current_reps_detailR=?, fail_streakL=?, fail_streakR=?, "
@@ -2954,16 +2959,14 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             actual_detail = [{"weight": s["actual_weight"], "reps": s["actual_reps"]}] * (s["actual_sets"] or 1)
                             actual_detail = actual_detail * 2
                         planned_w_at_the_time = s["planned_weight"]
+                        climb_step = 2 if beginner else 1
                         w, r, fail, slow, hold = adapt_actual_detail(
                             planned_w_at_the_time, planned_reps_detail, actual_detail,
-                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow
-                        )
-                        w, r = apply_progress_modifiers(
-                            w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                            s["actual_rir"], beginner, hold
+                            prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow, climb_step
                         )
                         beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
-                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
+                        # achieved и на "stepup" — см. комментарий в live-логировании выше.
+                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",
@@ -3014,16 +3017,15 @@ def undo_last_log(progression_id: int, x_init_data: str = Header(...)):
                             slow = False
                             hold = False
                         else:
+                            climb_step = 2 if beginner else 1
                             w, r, fail, slow, hold = adapt_actual_detail(
                                 planned_w_at_the_time, planned_reps_detail, actual_detail,
-                                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow
-                            )
-                            w, r = apply_progress_modifiers(
-                                w, r, planned_w_at_the_time, prog["rep_range_low"], prog["rep_range_high"], prog["increment"],
-                                s["actual_rir"], beginner, hold
+                                prog["rep_range_low"], prog["rep_range_high"], prog["increment"], fail, slow, climb_step
                             )
                         beginner = beginner and (w > planned_w_at_the_time or (hold == "success" and not slow))
-                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold == "success" else (None, None)
+                        # achieved и на "stepup" (обычный Step UP); AMRAP-пересчёт (hold=False
+                        # здесь) намеренно НЕ передаёт achieved — см. комментарий в live-логировании.
+                        achieved_w, achieved_r = (actual_detail[0]["weight"], [int(x["reps"]) for x in actual_detail]) if hold in ("success", "stepup") else (None, None)
                 conn.execute(
                     "UPDATE progressions SET current_weight=?, current_reps=?, current_reps_detail=?, fail_streak=?, "
                     "is_slow_mode=?, beginner_mode=?, status='active', updated_at=datetime('now') WHERE id=?",

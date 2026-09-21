@@ -279,6 +279,13 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(profiles)").fetchall()]
         if "show_measurements" not in cols:
             conn.execute("ALTER TABLE profiles ADD COLUMN show_measurements INTEGER NOT NULL DEFAULT 1")
+        # Внешность персонажа в блоке статистики (JSON с id-шниками из палитр фронтенда)
+        # и выбор трёх упражнений для рекордов (JSON-массив из 3 названий/null).
+        # NULL = "не выбирали" — фронтенд подставляет значения по умолчанию.
+        if "avatar" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN avatar TEXT")
+        if "stats_pins" not in cols:
+            conn.execute("ALTER TABLE profiles ADD COLUMN stats_pins TEXT")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "is_premium" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0")
@@ -924,6 +931,8 @@ class ProfileUpdateIn(BaseModel):
     show_exercises:    Optional[bool] = None
     show_comments:     Optional[bool] = None
     show_measurements: Optional[bool] = None
+    avatar:            Optional[dict] = None   # {} = сбросить на вид по умолчанию
+    stats_pins:        Optional[list] = None   # до 3 названий упражнений (или null)
 
 class FriendUsernameIn(BaseModel):
     username: str
@@ -1240,6 +1249,69 @@ def rename_exercise_note(body: ExerciseNoteRenameIn, x_init_data: str = Header(.
     return {"ok": True}
 
 
+# ── Внешность персонажа и рекорды: валидация и чтение ─────────────────────────
+# Сервер намеренно НЕ знает список допустимых значений (палитры живут во
+# фронтенде и будут расширяться): он лишь гарантирует, что в базу попадёт
+# маленький безопасный JSON — короткие ключи, значения-идентификаторы
+# ("blue", "s2", "wink") либо true/false. Всё остальное отсекается. Показ
+# другим людям при этом безопасен: фронтенд рисует только те id, которые есть
+# в его палитрах, а любые незнакомые значения заменяет на вид по умолчанию.
+
+_AVATAR_KEY = re.compile(r"^[a-zA-Z][a-zA-Z0-9]{0,15}$")
+_AVATAR_VAL = re.compile(r"^[a-z0-9_]{1,24}$")
+_AVATAR_MAX_KEYS = 16
+_PIN_MAX_LEN = 120
+
+
+def _clean_avatar(a: dict):
+    """Возвращает JSON-строку для БД либо None (пустой словарь = по умолчанию)."""
+    if not a:
+        return None
+    if len(a) > _AVATAR_MAX_KEYS:
+        raise HTTPException(400, "Слишком много параметров внешности")
+    out = {}
+    for k, v in a.items():
+        if not isinstance(k, str) or not _AVATAR_KEY.match(k):
+            raise HTTPException(400, "Недопустимый параметр внешности")
+        if isinstance(v, bool):
+            out[k] = v
+        elif isinstance(v, str) and _AVATAR_VAL.match(v):
+            out[k] = v
+        else:
+            raise HTTPException(400, "Недопустимое значение параметра внешности")
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _clean_pins(p: list):
+    """Ровно 3 слота: строка (название упражнения) либо None."""
+    if len(p) > 3:
+        raise HTTPException(400, "Можно выбрать не больше трёх упражнений")
+    out = []
+    for x in p:
+        if x is None:
+            out.append(None)
+        elif isinstance(x, str):
+            s = x.strip()
+            if len(s) > _PIN_MAX_LEN:
+                raise HTTPException(400, "Слишком длинное название упражнения")
+            out.append(s or None)
+        else:
+            raise HTTPException(400, "Недопустимое значение в списке рекордов")
+    while len(out) < 3:
+        out.append(None)
+    return json.dumps(out, ensure_ascii=False)
+
+
+def _json_or_none(raw):
+    """Читает JSON из колонки; битые/пустые данные дают None (= по умолчанию)."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
 # ── Роуты: профили ─────────────────────────────────────────────────────────────
 
 @app.get("/profiles")
@@ -1253,6 +1325,7 @@ def list_profiles(x_init_data: str = Header(...)):
         "show_workouts": bool(r["show_workouts"]), "show_exercises": bool(r["show_exercises"]),
         "show_comments": bool(r["show_comments"]), "show_measurements": bool(r["show_measurements"]),
         "is_active": r["id"] == active_id,
+        "avatar": _json_or_none(r["avatar"]), "stats_pins": _json_or_none(r["stats_pins"]),
     } for r in rows]
 
 
@@ -1288,6 +1361,10 @@ def update_profile(profile_id: int, p: ProfileUpdateIn, x_init_data: str = Heade
             fields.append("show_comments=?"); values.append(int(p.show_comments))
         if p.show_measurements is not None:
             fields.append("show_measurements=?"); values.append(int(p.show_measurements))
+        if p.avatar is not None:
+            fields.append("avatar=?"); values.append(_clean_avatar(p.avatar))
+        if p.stats_pins is not None:
+            fields.append("stats_pins=?"); values.append(_clean_pins(p.stats_pins))
         if p.is_main is not None:
             if p.is_main:
                 conn.execute("UPDATE profiles SET is_main=0 WHERE owner_id=?", (uid,))
@@ -1889,6 +1966,7 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                 "name": name, "profile_name": None,
                 "show_workouts": False, "show_exercises": False, "show_measurements": False,
                 "workouts": [], "measurements": [],
+                "avatar": None, "stats_pins": None,
             }
 
         show_w = bool(profile["show_workouts"])
@@ -1926,6 +2004,8 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
         "show_measurements": show_m,
         "workouts": workouts,
         "measurements": measurements,
+        "avatar": _json_or_none(profile["avatar"]),
+        "stats_pins": _json_or_none(profile["stats_pins"]),
     }
 
 

@@ -9,6 +9,7 @@ FastAPI + SQLite
 
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -24,6 +25,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Сжимает ответы больше 500 байт (gzip понимают все браузеры и fetch — распаковка
+# происходит прозрачно, на стороне клиента ничего менять не нужно). Тексты вроде
+# JSON со списком тренировок сжимаются в 15-25 раз, а на медленной мобильной
+# сети или в Telegram WebView вес ответа — это то, что реально ощущается как
+# "долго грузится", гораздо сильнее, чем время работы самого сервера.
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DB_PATH   = os.environ.get("DB_PATH", "gym.db")

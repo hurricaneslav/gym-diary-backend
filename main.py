@@ -2142,7 +2142,10 @@ def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self:
     show_e = is_self or bool(profile["show_exercises"])
     show_c = is_self or bool(profile["show_comments"])
     show_m = is_self or bool(profile["show_measurements"])
-    author = _user_display(conn, owner_id)
+    # Внешность персонажа автора — для аватарки в ленте. Хранится уже провалидированной
+    # (см. _clean_avatar при сохранении профиля); None = «по умолчанию» (фронтенд
+    # подставит вид по умолчанию). Только в постах ленты — у авторов комментариев не нужна.
+    author = {**_user_display(conn, owner_id), "avatar": _json_or_none(profile["avatar"])}
     posts = []
 
     if show_w:

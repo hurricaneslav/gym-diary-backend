@@ -133,6 +133,14 @@ def init_db():
                 date    TEXT NOT NULL,
                 data    TEXT NOT NULL DEFAULT '{}'
             );
+            CREATE TABLE IF NOT EXISTS weigh_ins (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                profile_id INTEGER NOT NULL,
+                date       TEXT NOT NULL,
+                weight     REAL NOT NULL,
+                UNIQUE (profile_id, date)
+            );
             CREATE TABLE IF NOT EXISTS templates (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    TEXT NOT NULL,
@@ -924,6 +932,11 @@ class MeasurementIn(BaseModel):
     date: str
     data: dict = {}
 
+class WeighInIn(BaseModel):
+    date:       str
+    weight:     float
+    replace_id: Optional[int] = None   # правка существующей записи (в т.ч. со сменой даты)
+
 class TemplateIn(BaseModel):
     id:        int
     name:      str
@@ -1177,6 +1190,89 @@ def save_measurement(m: MeasurementIn, x_init_data: str = Header(...)):
             return {"ok": True, "id": cur.lastrowid}
 
 
+# ── Роуты: взвешивания ────────────────────────────────────────────────────────
+# Быстрые записи веса (блок «Текущий вес» на вкладке «Замеры»). Живут отдельно от
+# замеров: не засоряют их список. Вес, вписанный внутрь замера, на график и в
+# список взвешиваний попадает на стороне фронтенда — он берётся прямо из самих
+# замеров, поэтому ничего не дублируется и не может разойтись (удалил замер —
+# его вес пропал из графика). Одна запись на дату в профиле.
+
+_WEIGH_IN_DDL = """
+    CREATE TABLE IF NOT EXISTS weigh_ins (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id    TEXT NOT NULL,
+        profile_id INTEGER NOT NULL,
+        date       TEXT NOT NULL,
+        weight     REAL NOT NULL,
+        UNIQUE (profile_id, date)
+    )
+"""
+
+def _ensure_weigh_ins(conn):
+    # Админка умеет подменять файл базы «на лету» (загрузка старого gym.db), а
+    # init_db при этом не перезапускается — страхуемся, чтобы старая база без
+    # этой таблицы не ломала вкладку до перезапуска сервера.
+    conn.execute(_WEIGH_IN_DDL)
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+def _weigh_in_json(r):
+    return {"id": r["id"], "date": r["date"], "weight": r["weight"]}
+
+
+@app.get("/weigh-ins")
+def list_weigh_ins(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        rows = conn.execute(
+            "SELECT id, date, weight FROM weigh_ins WHERE profile_id=? ORDER BY date DESC, id DESC", (pid,)
+        ).fetchall()
+    return [_weigh_in_json(r) for r in rows]
+
+
+@app.post("/weigh-ins")
+def save_weigh_in(body: WeighInIn, x_init_data: str = Header(...)):
+    """Создаёт или обновляет взвешивание на дату (одна запись на дату). С replace_id
+    сначала убирает правимую запись — так её можно перенести на другую дату одним
+    запросом; если на новой дате уже есть запись, она заменяется."""
+    if not _DATE_RE.match(body.date or ""):
+        raise HTTPException(400, "Неверная дата")
+    try:
+        datetime.date.fromisoformat(body.date)
+    except ValueError:
+        raise HTTPException(400, "Неверная дата")
+    w = round(body.weight, 2)
+    if not (20 <= w <= 400):
+        raise HTTPException(400, "Вес должен быть от 20 до 400 кг")
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        if body.replace_id is not None:
+            conn.execute("DELETE FROM weigh_ins WHERE profile_id=? AND id=?", (pid, body.replace_id))
+        conn.execute(
+            "INSERT INTO weigh_ins (user_id, profile_id, date, weight) VALUES (?,?,?,?) "
+            "ON CONFLICT(profile_id, date) DO UPDATE SET weight=excluded.weight",
+            (uid, pid, body.date, w)
+        )
+        row = conn.execute(
+            "SELECT id, date, weight FROM weigh_ins WHERE profile_id=? AND date=?", (pid, body.date)
+        ).fetchone()
+    return _weigh_in_json(row)
+
+
+@app.delete("/weigh-ins/{weigh_in_id}")
+def delete_weigh_in(weigh_in_id: int, x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        conn.execute("DELETE FROM weigh_ins WHERE profile_id=? AND id=?", (pid, weigh_in_id))
+    return {"ok": True}
+
+
 @app.delete("/measurements/{measurement_id}")
 def delete_measurement(measurement_id: int, x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
@@ -1394,6 +1490,8 @@ def delete_profile(profile_id: int, x_init_data: str = Header(...)):
 
         conn.execute("DELETE FROM workouts WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM measurements WHERE profile_id=?", (profile_id,))
+        _ensure_weigh_ins(conn)
+        conn.execute("DELETE FROM weigh_ins WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM templates WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid))
 
@@ -1497,7 +1595,7 @@ def _build_progression_export(progression_rows_with_sessions) -> list:
 
 
 def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exercise_notes: dict,
-                           progression_rows_with_sessions=None) -> str:
+                           progression_rows_with_sessions=None, weigh_in_rows=None) -> str:
     lines = [
         f"ДНЕВНИК ТРЕНИРОВОК — {profile_name}",
         f"Экспорт от {datetime.datetime.now().strftime('%d.%m.%Y %H:%M')}",
@@ -1544,6 +1642,14 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
             lines.append("  (ничего не заполнено)")
         if comment:
             lines.append(f"  Комментарий: {comment}")
+        lines.append("")
+
+    # Быстрые взвешивания (блок «Текущий вес»). Вес из самих замеров выше уже есть.
+    if weigh_in_rows:
+        lines += ["=" * 40, f"ВЗВЕШИВАНИЯ ({len(weigh_in_rows)})", "=" * 40, ""]
+        for r in sorted(weigh_in_rows, key=lambda r: (r["date"], r["id"])):
+            wv = r["weight"]
+            lines.append(f"{_fmt_date_ru(r['date'])} · {wv:g} кг")
         lines.append("")
 
     # Упражнения — список + описание техники + ПОЛНАЯ история по каждому (как в
@@ -1701,6 +1807,8 @@ def _profile_export_data(profile_id: int, uid: str):
             raise HTTPException(404, "Профиль не найден")
         workout_rows = conn.execute("SELECT * FROM workouts WHERE profile_id=?", (profile_id,)).fetchall()
         measurement_rows = conn.execute("SELECT * FROM measurements WHERE profile_id=?", (profile_id,)).fetchall()
+        _ensure_weigh_ins(conn)
+        weigh_in_rows = conn.execute("SELECT * FROM weigh_ins WHERE profile_id=?", (profile_id,)).fetchall()
         note_rows = conn.execute(
             "SELECT name_lc, note FROM exercise_notes WHERE profile_id=?", (profile_id,)
         ).fetchall()
@@ -1715,7 +1823,7 @@ def _profile_export_data(profile_id: int, uid: str):
             ).fetchall()
             progressions_with_sessions.append((prog, sessions))
     text = _build_profile_export(profile["name"], workout_rows, measurement_rows, exercise_notes,
-                                  progressions_with_sessions)
+                                  progressions_with_sessions, weigh_in_rows)
     return profile["name"], text
 
 

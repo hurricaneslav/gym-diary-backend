@@ -13,7 +13,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, PlainTextResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, os, secrets, shutil, time, html, html.parser, datetime, io, re
 
 app = FastAPI()
@@ -140,6 +140,11 @@ def init_db():
                 date       TEXT NOT NULL,
                 weight     REAL NOT NULL,
                 UNIQUE (profile_id, date)
+            );
+            CREATE TABLE IF NOT EXISTS measure_layouts (
+                profile_id INTEGER PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                layout     TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS templates (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1208,11 +1213,20 @@ _WEIGH_IN_DDL = """
     )
 """
 
+_MEASURE_LAYOUT_DDL = """
+    CREATE TABLE IF NOT EXISTS measure_layouts (
+        profile_id INTEGER PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        layout     TEXT NOT NULL
+    )
+"""
+
 def _ensure_weigh_ins(conn):
     # Админка умеет подменять файл базы «на лету» (загрузка старого gym.db), а
     # init_db при этом не перезапускается — страхуемся, чтобы старая база без
-    # этой таблицы не ломала вкладку до перезапуска сервера.
+    # этих таблиц не ломала вкладку до перезапуска сервера.
     conn.execute(_WEIGH_IN_DDL)
+    conn.execute(_MEASURE_LAYOUT_DDL)
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -1271,6 +1285,80 @@ def delete_weigh_in(weigh_in_id: int, x_init_data: str = Header(...)):
         pid = get_active_profile_id(conn, uid)
         conn.execute("DELETE FROM weigh_ins WHERE profile_id=? AND id=?", (pid, weigh_in_id))
     return {"ok": True}
+
+
+# ── Роуты: раскладка показателей на вкладке «Замеры» ───────────────────────────
+# Какие параметры замеров (талия, грудь, ...) вынесены на главный экран вкладки как
+# плитки, в каком порядке и в какой форме — «число» или «график», половина ширины
+# или во всю. Хранится на профиль (у каждого профиля свой дневник). Вес сюда не
+# входит: это отдельный главный блок.
+
+MEASURE_LAYOUT_MAX_TILES = 6
+_TILE_FORMS = ("value", "chart")
+_TILE_SIZES = ("half", "full")
+
+class MeasureTileIn(BaseModel):
+    key:  str
+    form: str = "value"
+    size: str = "half"
+
+class MeasureLayoutIn(BaseModel):
+    tiles: List[MeasureTileIn] = []
+
+def _clean_layout(tiles):
+    """Проверка и нормализация раскладки: только известные параметры (кроме веса),
+    без повторов, не больше MEASURE_LAYOUT_MAX_TILES, форма/размер из допустимых."""
+    out, seen = [], set()
+    for t in tiles:
+        if t.key == "weight" or t.key not in _MEASUREMENT_FIELD_LABELS:
+            raise HTTPException(400, f"Неизвестный параметр: {t.key}")
+        if t.key in seen:
+            raise HTTPException(400, "Параметр добавлен дважды")
+        if t.form not in _TILE_FORMS or t.size not in _TILE_SIZES:
+            raise HTTPException(400, "Неверная форма или размер плитки")
+        seen.add(t.key)
+        out.append({"key": t.key, "form": t.form, "size": t.size})
+    if len(out) > MEASURE_LAYOUT_MAX_TILES:
+        raise HTTPException(400, f"Не больше {MEASURE_LAYOUT_MAX_TILES} показателей")
+    return out
+
+
+@app.get("/measure-layout")
+def get_measure_layout(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        row = conn.execute("SELECT layout FROM measure_layouts WHERE profile_id=?", (pid,)).fetchone()
+    tiles = []
+    if row:
+        try:
+            raw = json.loads(row["layout"])
+            # Отдаём только то, что проходит проверку: если список полей когда-то
+            # изменится, устаревшие плитки тихо отпадут, а не сломают экран.
+            for t in raw.get("tiles", []):
+                if (isinstance(t, dict) and t.get("key") in _MEASUREMENT_FIELD_LABELS and t["key"] != "weight"
+                        and t.get("form") in _TILE_FORMS and t.get("size") in _TILE_SIZES
+                        and all(x["key"] != t["key"] for x in tiles)):
+                    tiles.append({"key": t["key"], "form": t["form"], "size": t["size"]})
+        except Exception:
+            tiles = []
+    return {"tiles": tiles[:MEASURE_LAYOUT_MAX_TILES]}
+
+
+@app.put("/measure-layout")
+def put_measure_layout(body: MeasureLayoutIn, x_init_data: str = Header(...)):
+    tiles = _clean_layout(body.tiles)
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        conn.execute(
+            "INSERT INTO measure_layouts (profile_id, user_id, layout) VALUES (?,?,?) "
+            "ON CONFLICT(profile_id) DO UPDATE SET layout=excluded.layout",
+            (pid, uid, json.dumps({"tiles": tiles}, ensure_ascii=False))
+        )
+    return {"tiles": tiles}
 
 
 @app.delete("/measurements/{measurement_id}")
@@ -1492,6 +1580,7 @@ def delete_profile(profile_id: int, x_init_data: str = Header(...)):
         conn.execute("DELETE FROM measurements WHERE profile_id=?", (profile_id,))
         _ensure_weigh_ins(conn)
         conn.execute("DELETE FROM weigh_ins WHERE profile_id=?", (profile_id,))
+        conn.execute("DELETE FROM measure_layouts WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM templates WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid))
 

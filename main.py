@@ -146,6 +146,11 @@ def init_db():
                 user_id    TEXT NOT NULL,
                 layout     TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS custom_fields (
+                profile_id INTEGER PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                fields     TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS templates (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id    TEXT NOT NULL,
@@ -1180,7 +1185,14 @@ def save_measurement(m: MeasurementIn, x_init_data: str = Header(...)):
         else:
             existing = None
 
-        data_json = json.dumps(m.data, ensure_ascii=False)
+        data = dict(m.data)
+        if "custom" in data:
+            cleaned = _clean_custom_values(data["custom"])
+            if cleaned:
+                data["custom"] = cleaned
+            else:
+                data.pop("custom")
+        data_json = json.dumps(data, ensure_ascii=False)
         if existing:
             conn.execute(
                 "UPDATE measurements SET name=?, date=?, data=? WHERE profile_id=? AND id=?",
@@ -1221,12 +1233,22 @@ _MEASURE_LAYOUT_DDL = """
     )
 """
 
+_CUSTOM_FIELD_DDL = """
+    CREATE TABLE IF NOT EXISTS custom_fields (
+        profile_id INTEGER PRIMARY KEY,
+        user_id    TEXT NOT NULL,
+        fields     TEXT NOT NULL
+    )
+"""
+
 def _ensure_weigh_ins(conn):
     # Админка умеет подменять файл базы «на лету» (загрузка старого gym.db), а
     # init_db при этом не перезапускается — страхуемся, чтобы старая база без
-    # этих таблиц не ломала вкладку до перезапуска сервера.
+    # этих таблиц (взвешивания, раскладка показателей, свои поля замеров) не ломала
+    # вкладку до перезапуска сервера.
     conn.execute(_WEIGH_IN_DDL)
     conn.execute(_MEASURE_LAYOUT_DDL)
+    conn.execute(_CUSTOM_FIELD_DDL)
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -1287,6 +1309,123 @@ def delete_weigh_in(weigh_in_id: int, x_init_data: str = Header(...)):
     return {"ok": True}
 
 
+# ── Свои поля замеров ──────────────────────────────────────────────────────────
+# Человек может завести собственную метрику (пульс покоя, обхват запястья, ...).
+# Значения лежат прямо в замере, в data["custom"] = [{name, unit, value}] — вместе с
+# названием и единицей, поэтому друзьям, ленте и экспорту не нужен отдельный справочник,
+# а удаление поля из формы не ломает историю. Справочник (custom_fields) нужен только
+# форме нового замера: какие поля предлагать вписать. Поле опознаётся по названию без
+# учёта регистра и лишних пробелов.
+
+CUSTOM_FIELD_MAX = 12
+CUSTOM_NAME_MAX = 40
+CUSTOM_UNIT_MAX = 12
+
+def _norm_name(s) -> str:
+    return " ".join(str(s).split()).lower()
+
+def _has_control(s: str) -> bool:
+    return any(ord(ch) < 32 for ch in s)
+
+def _is_custom_key(k) -> bool:
+    """Ключ плитки для своего поля: «c:» + название в канонической (нормализованной) форме."""
+    if not isinstance(k, str) or not k.startswith("c:"):
+        return False
+    n = k[2:]
+    return 1 <= len(n) <= CUSTOM_NAME_MAX and n == _norm_name(n) and not _has_control(n)
+
+def _clean_custom_values(raw):
+    """Значения своих полей в замере: только список словарей с разумными name/unit и числовым
+    value, без повторов. Всё остальное молча отбрасывается (в ленте и профиле друга это
+    выводится как текст, так что мусор не должен туда попадать)."""
+    out, seen = [], set()
+    if not isinstance(raw, list):
+        return out
+    for e in raw:
+        if not isinstance(e, dict):
+            continue
+        name = " ".join(str(e.get("name", "")).split())
+        unit = str(e.get("unit", "") or "").strip()
+        val = str(e.get("value", "")).strip().replace(",", ".")
+        if not (1 <= len(name) <= CUSTOM_NAME_MAX) or _has_control(name) or len(unit) > CUSTOM_UNIT_MAX or _has_control(unit):
+            continue
+        try:
+            f = float(val)
+        except ValueError:
+            continue
+        if f != f or f in (float("inf"), float("-inf")) or len(val) > 20:
+            continue
+        k = _norm_name(name)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append({"name": name, "unit": unit, "value": val})
+        if len(out) >= CUSTOM_FIELD_MAX:
+            break
+    return out
+
+class CustomFieldIn(BaseModel):
+    name: str
+    unit: str = ""
+
+class CustomFieldsIn(BaseModel):
+    fields: List[CustomFieldIn] = []
+
+def _clean_custom_fields(fields):
+    out, seen = [], set()
+    reserved = {_norm_name(l) for l in _MEASUREMENT_FIELD_LABELS.values()}
+    for f in fields:
+        name = " ".join(f.name.split())
+        unit = f.unit.strip()
+        if not (1 <= len(name) <= CUSTOM_NAME_MAX) or _has_control(name):
+            raise HTTPException(400, f"Название — от 1 до {CUSTOM_NAME_MAX} символов")
+        if len(unit) > CUSTOM_UNIT_MAX or _has_control(unit):
+            raise HTTPException(400, f"Единица — до {CUSTOM_UNIT_MAX} символов")
+        k = _norm_name(name)
+        if k in reserved:
+            raise HTTPException(400, "Такой показатель уже есть среди стандартных")
+        if k in seen:
+            raise HTTPException(400, "Поле с таким названием уже есть")
+        seen.add(k)
+        out.append({"name": name, "unit": unit})
+    if len(out) > CUSTOM_FIELD_MAX:
+        raise HTTPException(400, f"Не больше {CUSTOM_FIELD_MAX} своих полей")
+    return out
+
+
+@app.get("/custom-fields")
+def get_custom_fields(x_init_data: str = Header(...)):
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        row = conn.execute("SELECT fields FROM custom_fields WHERE profile_id=?", (pid,)).fetchone()
+    out = []
+    if row:
+        try:
+            for f in json.loads(row["fields"]):
+                if isinstance(f, dict) and isinstance(f.get("name"), str) and 1 <= len(f["name"]) <= CUSTOM_NAME_MAX:
+                    out.append({"name": f["name"], "unit": str(f.get("unit", ""))[:CUSTOM_UNIT_MAX]})
+        except Exception:
+            out = []
+    return {"fields": out[:CUSTOM_FIELD_MAX]}
+
+
+@app.put("/custom-fields")
+def put_custom_fields(body: CustomFieldsIn, x_init_data: str = Header(...)):
+    fields = _clean_custom_fields(body.fields)
+    uid = get_user_id(x_init_data)
+    with get_db() as conn:
+        _ensure_weigh_ins(conn)
+        pid = get_active_profile_id(conn, uid)
+        conn.execute(
+            "INSERT INTO custom_fields (profile_id, user_id, fields) VALUES (?,?,?) "
+            "ON CONFLICT(profile_id) DO UPDATE SET fields=excluded.fields",
+            (pid, uid, json.dumps(fields, ensure_ascii=False))
+        )
+    return {"fields": fields}
+
+
 # ── Роуты: раскладка показателей на вкладке «Замеры» ───────────────────────────
 # Какие параметры замеров (талия, грудь, ...) вынесены на главный экран вкладки как
 # плитки, в каком порядке и в какой форме — «число» или «график», половина ширины
@@ -1310,7 +1449,7 @@ def _clean_layout(tiles):
     без повторов, не больше MEASURE_LAYOUT_MAX_TILES, форма/размер из допустимых."""
     out, seen = [], set()
     for t in tiles:
-        if t.key == "weight" or t.key not in _MEASUREMENT_FIELD_LABELS:
+        if t.key == "weight" or not (t.key in _MEASUREMENT_FIELD_LABELS or _is_custom_key(t.key)):
             raise HTTPException(400, f"Неизвестный параметр: {t.key}")
         if t.key in seen:
             raise HTTPException(400, "Параметр добавлен дважды")
@@ -1323,27 +1462,33 @@ def _clean_layout(tiles):
     return out
 
 
+def _read_layout_tiles(conn, pid):
+    """Сохранённая раскладка профиля, очищенная от всего, что не проходит проверку
+    (устаревшие/битые плитки тихо отпадают, а не ломают экран)."""
+    row = conn.execute("SELECT layout FROM measure_layouts WHERE profile_id=?", (pid,)).fetchone()
+    tiles = []
+    if row:
+        try:
+            raw = json.loads(row["layout"])
+            for t in raw.get("tiles", []):
+                if (isinstance(t, dict) and t.get("key") != "weight"
+                        and (t.get("key") in _MEASUREMENT_FIELD_LABELS or _is_custom_key(t.get("key")))
+                        and t.get("form") in _TILE_FORMS and t.get("size") in _TILE_SIZES
+                        and all(x["key"] != t["key"] for x in tiles)):
+                    tiles.append({"key": t["key"], "form": t["form"], "size": t["size"]})
+        except Exception:
+            tiles = []
+    return tiles[:MEASURE_LAYOUT_MAX_TILES]
+
+
 @app.get("/measure-layout")
 def get_measure_layout(x_init_data: str = Header(...)):
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         _ensure_weigh_ins(conn)
         pid = get_active_profile_id(conn, uid)
-        row = conn.execute("SELECT layout FROM measure_layouts WHERE profile_id=?", (pid,)).fetchone()
-    tiles = []
-    if row:
-        try:
-            raw = json.loads(row["layout"])
-            # Отдаём только то, что проходит проверку: если список полей когда-то
-            # изменится, устаревшие плитки тихо отпадут, а не сломают экран.
-            for t in raw.get("tiles", []):
-                if (isinstance(t, dict) and t.get("key") in _MEASUREMENT_FIELD_LABELS and t["key"] != "weight"
-                        and t.get("form") in _TILE_FORMS and t.get("size") in _TILE_SIZES
-                        and all(x["key"] != t["key"] for x in tiles)):
-                    tiles.append({"key": t["key"], "form": t["form"], "size": t["size"]})
-        except Exception:
-            tiles = []
-    return {"tiles": tiles[:MEASURE_LAYOUT_MAX_TILES]}
+        tiles = _read_layout_tiles(conn, pid)
+    return {"tiles": tiles}
 
 
 @app.put("/measure-layout")
@@ -1581,6 +1726,7 @@ def delete_profile(profile_id: int, x_init_data: str = Header(...)):
         _ensure_weigh_ins(conn)
         conn.execute("DELETE FROM weigh_ins WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM measure_layouts WHERE profile_id=?", (profile_id,))
+        conn.execute("DELETE FROM custom_fields WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM templates WHERE profile_id=?", (profile_id,))
         conn.execute("DELETE FROM profiles WHERE id=? AND owner_id=?", (profile_id, uid))
 
@@ -1726,6 +1872,9 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
                 unit = "кг" if key == "weight" else "см"
                 lines.append(f"  {label}: {val} {unit}")
                 filled = True
+        for c in _clean_custom_values(data.get("custom")):
+            lines.append(f"  {c['name']}: {c['value']}" + (f" {c['unit']}" if c["unit"] else ""))
+            filled = True
         comment = (data.get("comment") or "").strip()
         if not filled and not comment:
             lines.append("  (ничего не заполнено)")
@@ -2171,6 +2320,7 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                 "name": name, "profile_name": None,
                 "show_workouts": False, "show_exercises": False, "show_measurements": False,
                 "workouts": [], "measurements": [],
+                "weigh_ins": [], "measure_layout": {"tiles": []},
                 "avatar": None, "stats_pins": None,
             }
 
@@ -2192,6 +2342,8 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                 workouts.append({"id": r["id"], "name": r["name"], "date": r["date"], "exercises": exs})
 
         measurements = []
+        weigh_ins = []
+        layout_tiles = []
         if show_m:
             rows = conn.execute(
                 "SELECT * FROM measurements WHERE profile_id=? ORDER BY id DESC", (profile["id"],)
@@ -2200,6 +2352,12 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                 item = {"id": r["id"], "name": r["name"], "date": r["date"]}
                 item.update(json.loads(r["data"]))
                 measurements.append(item)
+            # Вес и графики — часть раздела «Замеры»: видны ровно тогда, когда друг его открыл.
+            _ensure_weigh_ins(conn)
+            weigh_ins = [_weigh_in_json(r) for r in conn.execute(
+                "SELECT id, date, weight FROM weigh_ins WHERE profile_id=? ORDER BY date DESC, id DESC", (profile["id"],)
+            ).fetchall()]
+            layout_tiles = _read_layout_tiles(conn, profile["id"])
 
     return {
         "name": name,
@@ -2209,6 +2367,8 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
         "show_measurements": show_m,
         "workouts": workouts,
         "measurements": measurements,
+        "weigh_ins": weigh_ins,
+        "measure_layout": {"tiles": layout_tiles},
         "avatar": _json_or_none(profile["avatar"]),
         "stats_pins": _json_or_none(profile["stats_pins"]),
     }

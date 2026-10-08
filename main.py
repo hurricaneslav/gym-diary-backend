@@ -18,10 +18,87 @@ import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, os, secrets, 
 
 app = FastAPI()
 
+# ── Защита от дублей при повторных запросах ──────────────────────────────────
+# Фронтенд повторяет запрос при обрыве сети. Если сервер уже успел выполнить
+# POST, а ответ потерялся, повтор раньше создавал дубль (вторую тренировку,
+# второй комментарий, лайк переключался обратно). Теперь каждый POST несёт
+# уникальный ключ x-idempotency-key (один и тот же во всех повторах одного
+# действия): сервер выполняет действие один раз и на повтор отдаёт тот же ответ.
+# Middleware добавлен ПЕРВЫМ, т.е. стоит внутри CORS и gzip — ответ-повтор
+# получает те же CORS-заголовки. Без заголовка (старый фронтенд) — всё как раньше.
+import asyncio
+from starlette.concurrency import run_in_threadpool
+from starlette.responses import Response as _PlainResponse, JSONResponse as _JSONResponse
+
+_IDEM_TTL   = 24 * 3600   # ключи хранятся сутки
+_IDEM_STALE = 60          # «зависший» ключ без ответа старше 60с можно перехватить
+
+def _idem_claim(k):
+    """('new',None) — выполняем; ('done',(status,body)) — вернуть сохранённое; ('busy',None) — идёт."""
+    now = int(time.time())
+    with get_db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS idempotency_keys (k TEXT PRIMARY KEY, response TEXT, status INTEGER, created_at INTEGER NOT NULL)")
+        conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (now - _IDEM_TTL,))
+        try:
+            conn.execute("INSERT INTO idempotency_keys (k, created_at) VALUES (?,?)", (k, now))
+            return ("new", None)
+        except sqlite3.IntegrityError:
+            row = conn.execute("SELECT response, status, created_at FROM idempotency_keys WHERE k=?", (k,)).fetchone()
+            if row and row["response"] is not None:
+                return ("done", (row["status"], row["response"]))
+            if row and now - row["created_at"] > _IDEM_STALE:
+                conn.execute("UPDATE idempotency_keys SET created_at=? WHERE k=?", (now, k))
+                return ("new", None)
+            return ("busy", None)
+
+def _idem_store(k, status, body):
+    with get_db() as conn:
+        conn.execute("UPDATE idempotency_keys SET response=?, status=? WHERE k=?", (body, status, k))
+
+def _idem_release(k):
+    with get_db() as conn:
+        conn.execute("DELETE FROM idempotency_keys WHERE k=? AND response IS NULL", (k,))
+
+@app.middleware("http")
+async def _idempotency_middleware(request, call_next):
+    key = request.headers.get("x-idempotency-key")
+    if request.method != "POST" or not key or len(key) > 100:
+        return await call_next(request)
+    scope = hashlib.sha256(request.headers.get("x-init-data", "").encode()).hexdigest()[:24]
+    k = f"{scope}:{request.url.path}:{key}"
+    state, data = await run_in_threadpool(_idem_claim, k)
+    if state == "busy":          # первый запрос ещё выполняется — ждём его результат до ~10с
+        for _ in range(40):
+            await asyncio.sleep(0.25)
+            state, data = await run_in_threadpool(_idem_claim, k)
+            if state != "busy":
+                break
+        else:
+            return _JSONResponse({"detail": "Запрос ещё выполняется"}, status_code=409)
+    if state == "done":
+        status, body = data
+        return _PlainResponse(content=body, status_code=status, media_type="application/json",
+                              headers={"x-idempotent-replay": "1"})
+    try:
+        response = await call_next(request)
+    except Exception:
+        await run_in_threadpool(_idem_release, k)
+        raise
+    body = b"".join([chunk async for chunk in response.body_iterator])
+    if response.status_code == 200:
+        await run_in_threadpool(_idem_store, k, 200, body.decode("utf-8"))
+    else:
+        await run_in_threadpool(_idem_release, k)   # ошибка — повтор должен сработать заново
+    return _PlainResponse(content=body, status_code=response.status_code, headers=dict(response.headers))
+
 # ── CORS — разрешаем запросы с GitHub Pages ──────────────────────────────────
+# По умолчанию — как раньше (любой источник; авторизация идёт заголовком, не cookie,
+# поэтому это не дыра). Чтобы ограничить, задай в Railway → Variables
+# CORS_ORIGINS=https://твой-ник.github.io (несколько — через запятую).
+_cors_origins = [o.strip().rstrip("/") for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # после тестов замени на свой домен
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,6 +111,12 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+# Режим разработки (проверка подписи Telegram отключена, любой initData считается
+# настоящим) включается ТОЛЬКО явно: DEV_MODE=1. Раньше он включался сам, если
+# BOT_TOKEN пуст — потеря переменной на сервере открывала бы доступ под чужим id.
+DEV_MODE = os.environ.get("DEV_MODE", "") == "1"
+# Как долго initData считается свежим (защита от повторного использования утёкшего).
+INITDATA_MAX_AGE = int(os.environ.get("INITDATA_MAX_AGE", str(7 * 24 * 3600)))
 DB_PATH   = os.environ.get("DB_PATH", "gym.db")
 
 # ── Бот больше не отдельный сервис на long polling — см. секцию "Telegram-бот
@@ -51,8 +134,18 @@ PUBLIC_URL              = os.environ.get("PUBLIC_URL", "").rstrip("/")
 
 # ── База данных ───────────────────────────────────────────────────────────────
 
+class _ClosingConnection(sqlite3.Connection):
+    """`with get_db() as conn:` в sqlite3 только коммитит, но не закрывает соединение.
+    Здесь по выходу из with соединение ещё и закрывается — не копятся открытые файлы."""
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15, factory=_ClosingConnection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -63,10 +156,12 @@ def ensure_profile_and_user(conn, uid, username=None, first_name=None):
     один профиль. Если он новый — создаётся "Профиль 1" (основной, всё видно).
     Возвращает active_profile_id.
     """
-    row = conn.execute("SELECT active_profile_id FROM users WHERE user_id=?", (uid,)).fetchone()
+    row = conn.execute("SELECT active_profile_id, username, first_name FROM users WHERE user_id=?", (uid,)).fetchone()
 
     if row:
-        if username is not None or first_name is not None:
+        # пишем в БД только если имя/юзернейм реально изменились (раньше — на каждый запрос)
+        if (username is not None or first_name is not None) and \
+           (row["username"] != username or row["first_name"] != first_name):
             conn.execute(
                 "UPDATE users SET username=?, first_name=? WHERE user_id=?",
                 (username, first_name, uid)
@@ -388,6 +483,23 @@ def init_db():
 
         migrate_legacy_data(conn)
 
+        # Индексы под частые выборки (лента, лайки/комментарии, друзья, история).
+        # IF NOT EXISTS — безопасно при каждом старте; ошибка одного индекса
+        # (например, нет колонки в очень старой базе) не мешает запуску.
+        for _ddl in (
+            "CREATE INDEX IF NOT EXISTS idx_workouts_profile ON workouts(profile_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_measurements_profile ON measurements(profile_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_post_likes_post ON post_likes(post_type, post_id)",
+            "CREATE INDEX IF NOT EXISTS idx_post_comments_post ON post_comments(post_type, post_id)",
+            "CREATE INDEX IF NOT EXISTS idx_friends_a ON friends(user_a)",
+            "CREATE INDEX IF NOT EXISTS idx_friends_b ON friends(user_b)",
+            "CREATE INDEX IF NOT EXISTS idx_profiles_owner ON profiles(owner_id)",
+        ):
+            try:
+                conn.execute(_ddl)
+            except sqlite3.OperationalError:
+                pass
+
     print("✅ База данных готова")
 
 init_db()
@@ -401,6 +513,8 @@ def parse_telegram_user(init_data: str) -> Optional[dict]:
     {id, username, first_name}. Возвращает None если подпись неверна.
     """
     if not BOT_TOKEN:
+        if not DEV_MODE:
+            return None   # без токена и без явного DEV_MODE=1 никого не пускаем
         try:
             params = dict(urllib.parse.parse_qsl(init_data))
             user   = json.loads(params.get("user", "{}"))
@@ -421,6 +535,10 @@ def parse_telegram_user(init_data: str) -> Optional[dict]:
 
         if not hmac.compare_digest(computed, hash_value):
             return None
+
+        auth_date = params.get("auth_date", "")
+        if auth_date.isdigit() and time.time() - int(auth_date) > INITDATA_MAX_AGE:
+            return None   # слишком старая подпись — приложение нужно открыть заново
 
         user = json.loads(params.get("user", "{}"))
         return {
@@ -930,6 +1048,33 @@ def adapt_amrap(planned_weight, planned_reps, low, increment, actual_weight, act
 
 # ── Модели ────────────────────────────────────────────────────────────────────
 
+def _check_date(d):
+    try:
+        datetime.date.fromisoformat(d or "")
+        if len(d) != 10:
+            raise ValueError
+    except ValueError:
+        raise HTTPException(400, "Неверная дата")
+
+def _check_exercises(exs, max_items=100, max_sets=100, max_json=400_000):
+    """Грубые ограничения формы и размера: данные видят друзья в ленте — один испорченный
+    или раздутый пост не должен тормозить чужие устройства."""
+    if len(exs) > max_items:
+        raise HTTPException(400, "Слишком много упражнений")
+    for e in exs:
+        if not isinstance(e, dict):
+            raise HTTPException(400, "Неверный формат упражнения")
+        sets = e.get("sets")
+        if sets is not None and (not isinstance(sets, list) or len(sets) > max_sets):
+            raise HTTPException(400, "Неверный формат подходов")
+    if len(json.dumps(exs, ensure_ascii=False)) > max_json:
+        raise HTTPException(413, "Слишком большой объём данных")
+
+def _check_title(name, limit=200):
+    if len(name or "") > limit:
+        raise HTTPException(400, "Слишком длинное название")
+
+
 class WorkoutIn(BaseModel):
     id:        int
     name:      str
@@ -1074,6 +1219,7 @@ def list_workouts(x_init_data: str = Header(...)):
 
 @app.post("/workouts")
 def save_workout(w: WorkoutIn, x_init_data: str = Header(...)):
+    _check_date(w.date); _check_title(w.name); _check_exercises(w.exercises)
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
@@ -1122,6 +1268,7 @@ def list_templates(x_init_data: str = Header(...)):
 
 @app.post("/templates")
 def save_template(t: TemplateIn, x_init_data: str = Header(...)):
+    _check_title(t.name); _check_exercises(t.exercises)
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
@@ -1175,6 +1322,9 @@ def list_measurements(x_init_data: str = Header(...)):
 
 @app.post("/measurements")
 def save_measurement(m: MeasurementIn, x_init_data: str = Header(...)):
+    _check_date(m.date); _check_title(m.name)
+    if len(json.dumps(m.dict(), ensure_ascii=False)) > 60_000:
+        raise HTTPException(413, "Слишком большой объём данных")
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
@@ -2486,7 +2636,22 @@ def list_news(x_init_data: str = Header(...)):
     return posts
 
 
-def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self: bool = False) -> list:
+def _feed_rows(conn, table: str, profile_id: int, before: str, limit):
+    """Строки ленты одного профиля в порядке sort_key (новые сверху). В страницу ленты
+    попадает не больше `limit` постов, поэтому с каждого автора достаточно прочитать
+    не больше `limit` свежих записей (старше курсора `before`) — а не всю историю."""
+    key = "(date || 'T' || printf('%08d', id))"
+    sql, args = f"SELECT * FROM {table} WHERE profile_id=?", [profile_id]
+    if before:
+        sql += f" AND {key} < ?"; args.append(before)
+    sql += f" ORDER BY {key} DESC"
+    if limit:
+        sql += " LIMIT ?"; args.append(limit)
+    return conn.execute(sql, args).fetchall()
+
+
+def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self: bool = False,
+                          before: str = "", limit: int = None) -> list:
     """Собирает посты ленты (тренировки+замеры) для одного профиля. Для
     друзей уважает его тумблеры видимости (show_workouts/show_exercises/
     show_comments/show_measurements) — так же, как get_friend_profile. Для
@@ -2506,7 +2671,7 @@ def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self:
     posts = []
 
     if show_w:
-        rows = conn.execute("SELECT * FROM workouts WHERE profile_id=? ORDER BY id DESC", (profile["id"],)).fetchall()
+        rows = _feed_rows(conn, "workouts", profile["id"], before, limit)
         for r in rows:
             exs = json.loads(r["exercises"]) if show_e else []
             if not show_c:
@@ -2519,7 +2684,7 @@ def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self:
             })
 
     if show_m:
-        rows = conn.execute("SELECT * FROM measurements WHERE profile_id=? ORDER BY id DESC", (profile["id"],)).fetchall()
+        rows = _feed_rows(conn, "measurements", profile["id"], before, limit)
         for r in rows:
             item = {"post_type": "measurement", "post_id": r["id"], "date": r["date"], "sort_key": f"{r['date']}T{r['id']:08d}", "author": author, "title": r["name"]}
             item.update(json.loads(r["data"]))
@@ -2539,6 +2704,7 @@ def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(
     видимости (show_workouts/show_exercises/show_comments/show_measurements),
     которые уже читаются построчно в get_friend_profile — переиспользуем ту же логику.
     """
+    limit = max(1, min(limit, 50))   # клиент не может запросить «всю ленту» одним махом
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         rows = conn.execute("SELECT user_a, user_b FROM friends WHERE user_a=? OR user_b=?", (uid, uid)).fetchall()
@@ -2548,10 +2714,10 @@ def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(
         # Свои посты тоже входят в ленту — иначе не увидеть лайки/комментарии
         # к собственным тренировкам и замерам от друзей.
         my_profile = conn.execute("SELECT * FROM profiles WHERE owner_id=? AND is_main=1", (uid,)).fetchone()
-        all_posts.extend(_feed_posts_for_owner(conn, uid, uid, my_profile, is_self=True))
+        all_posts.extend(_feed_posts_for_owner(conn, uid, uid, my_profile, is_self=True, before=before, limit=limit))
         for fid in friend_ids:
             profile = conn.execute("SELECT * FROM profiles WHERE owner_id=? AND is_main=1", (fid,)).fetchone()
-            all_posts.extend(_feed_posts_for_owner(conn, fid, uid, profile))
+            all_posts.extend(_feed_posts_for_owner(conn, fid, uid, profile, before=before, limit=limit))
 
         all_posts.sort(key=lambda p: p["sort_key"], reverse=True)
         if before:
@@ -2579,12 +2745,41 @@ def community_feed(before: str = "", limit: int = 20, x_init_data: str = Header(
     }
 
 
+def _can_access_post(conn, uid, post_type, post_id) -> bool:
+    """Можно ли пользователю взаимодействовать с постом: свой пост, либо пост
+    основного профиля друга, который друг не скрыл тумблером (ровно то, что и видно в ленте)."""
+    table = "workouts" if post_type == "workout" else "measurements"
+    row = conn.execute(f"SELECT profile_id FROM {table} WHERE id=?", (post_id,)).fetchone()
+    if not row or row["profile_id"] is None:
+        return False
+    prof = conn.execute("SELECT * FROM profiles WHERE id=?", (row["profile_id"],)).fetchone()
+    if not prof:
+        return False
+    owner = prof["owner_id"]
+    if owner == uid:
+        return True
+    if not prof["is_main"]:
+        return False
+    fr = conn.execute(
+        "SELECT 1 FROM friends WHERE (user_a=? AND user_b=?) OR (user_a=? AND user_b=?)",
+        (uid, owner, owner, uid)
+    ).fetchone()
+    if not fr:
+        return False
+    return bool(prof["show_workouts"] if post_type == "workout" else prof["show_measurements"])
+
+
+MAX_COMMENT_LEN = 1000
+
+
 @app.post("/community/{post_type}/{post_id}/like")
 def toggle_like(post_type: str, post_id: int, x_init_data: str = Header(...)):
     if post_type not in ("workout", "measurement"):
         raise HTTPException(400, "Неверный тип поста")
     uid = get_user_id(x_init_data)
     with get_db() as conn:
+        if not _can_access_post(conn, uid, post_type, post_id):
+            raise HTTPException(404, "Пост не найден")
         existing = conn.execute(
             "SELECT 1 FROM post_likes WHERE post_type=? AND post_id=? AND user_id=?", (post_type, post_id, uid)
         ).fetchone()
@@ -2607,8 +2802,12 @@ def add_comment(post_type: str, post_id: int, body: CommentIn, x_init_data: str 
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "Пустой комментарий")
+    if len(text) > MAX_COMMENT_LEN:
+        raise HTTPException(400, f"Комментарий длиннее {MAX_COMMENT_LEN} символов")
     uid = get_user_id(x_init_data)
     with get_db() as conn:
+        if not _can_access_post(conn, uid, post_type, post_id):
+            raise HTTPException(404, "Пост не найден")
         cur = conn.execute(
             "INSERT INTO post_comments (post_type, post_id, user_id, text) VALUES (?,?,?,?)",
             (post_type, post_id, uid, text)

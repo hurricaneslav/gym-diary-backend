@@ -14,7 +14,8 @@ from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, Plai
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional, List
-import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, os, secrets, shutil, time, html, html.parser, datetime, io, re
+import sqlite3, json, hmac, hashlib, urllib.parse, urllib.request, urllib.error, os, secrets, shutil, time, html, html.parser, datetime, io, re
+import threading, tempfile, gzip
 
 app = FastAPI()
 
@@ -552,6 +553,141 @@ def parse_telegram_user(init_data: str) -> Optional[dict]:
 
 # ── Dependency: получить user_id из заголовка (и обновить его профиль/юзернейм) ──
 
+# ── Автобэкап базы в Telegram ────────────────────────────────────────────────
+# Раз в BACKUP_EVERY_DAYS дней (по умолчанию 7) бот присылает файл базы документом
+# в личные сообщения владельца. Включается двумя переменными в Railway → Variables:
+#   BACKUP_CHAT_ID    — твой числовой Telegram-id (бот должен быть запущен тобой: /start)
+#   BACKUP_EVERY_DAYS — необязательно, как часто (по умолчанию 7)
+# Сервер на Railway засыпает, поэтому отдельного «планировщика» нет: когда приложением
+# пользуются, обычный запрос заодно проверяет, не пора ли делать бэкап, и если пора —
+# отправляет его в фоне, не задерживая ответ. Присланный файл — обычная SQLite-база:
+# её можно загрузить обратно через админку («Загрузить базу»).
+BACKUP_CHAT_ID    = os.environ.get("BACKUP_CHAT_ID", "").strip()
+try:
+    BACKUP_EVERY_DAYS = float(os.environ.get("BACKUP_EVERY_DAYS", "7") or 7)
+except ValueError:
+    BACKUP_EVERY_DAYS = 7.0
+TELEGRAM_API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")  # переопределяется только в тестах
+_TG_FILE_LIMIT    = 49 * 1024 * 1024    # лимит Telegram на файл — 50 МБ
+_BACKUP_STAMP     = DB_PATH + ".lastbackup"
+_backup_lock      = threading.Lock()
+_backup_state     = {"last_check": 0.0, "last_attempt": 0.0}
+
+
+def _backup_last_ts() -> float:
+    try:
+        with open(_BACKUP_STAMP, "r", encoding="utf-8") as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def _backup_due(now: float = None) -> bool:
+    now = time.time() if now is None else now
+    return bool(BOT_TOKEN and BACKUP_CHAT_ID) and now - _backup_last_ts() >= BACKUP_EVERY_DAYS * 86400
+
+
+def _make_db_snapshot(dest_path: str) -> None:
+    """Согласованный снимок живой базы средствами SQLite (безопасно при параллельных записях)."""
+    src_conn = sqlite3.connect(DB_PATH)
+    dst_conn = sqlite3.connect(dest_path)
+    try:
+        src_conn.backup(dst_conn)
+    finally:
+        dst_conn.close()
+        src_conn.close()
+
+
+def _telegram_send_file(chat_id: str, filename: str, data: bytes, caption: str = "") -> None:
+    boundary = secrets.token_hex(16)
+    body = io.BytesIO()
+
+    def w(part):
+        body.write(part.encode("utf-8") if isinstance(part, str) else part)
+
+    w(f"--{boundary}\r\n")
+    w(f'Content-Disposition: form-data; name="chat_id"\r\n\r\n{chat_id}\r\n')
+    if caption:
+        w(f"--{boundary}\r\n")
+        w(f'Content-Disposition: form-data; name="caption"\r\n\r\n{caption}\r\n')
+    w(f"--{boundary}\r\n")
+    w(f'Content-Disposition: form-data; name="document"; filename="{filename}"\r\n')
+    w("Content-Type: application/octet-stream\r\n\r\n")
+    w(data)
+    w("\r\n")
+    w(f"--{boundary}--\r\n")
+    req = urllib.request.Request(
+        f"{TELEGRAM_API_BASE}/bot{BOT_TOKEN}/sendDocument",
+        data=body.getvalue(),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:      # Telegram отвечает JSON с описанием и при ошибках
+        try:
+            result = json.loads(e.read().decode("utf-8"))
+        except Exception:
+            raise RuntimeError(f"Telegram вернул HTTP {e.code}")
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Неизвестная ошибка Telegram API"))
+
+
+def do_backup_to_telegram() -> str:
+    """Снимок базы → документом в Telegram. Возвращает имя файла; при ошибке бросает исключение."""
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN не задан")
+    if not BACKUP_CHAT_ID:
+        raise RuntimeError("BACKUP_CHAT_ID не задан (Railway → Variables)")
+    tmpdir = tempfile.mkdtemp(prefix="gymbackup-")
+    try:
+        snap = os.path.join(tmpdir, "gym.db")
+        _make_db_snapshot(snap)
+        with open(snap, "rb") as f:
+            data = f.read()
+        stamp = time.strftime("%Y-%m-%d_%H%M", time.gmtime())
+        name = f"gym-{stamp}.db"
+        caption = f"Бэкап базы · {stamp} UTC · {max(1, len(data) // 1024)} КБ"
+        if len(data) > _TG_FILE_LIMIT:
+            data = gzip.compress(data)
+            name += ".gz"
+            caption += " · сжат gzip: перед загрузкой в админку распакуй"
+            if len(data) > _TG_FILE_LIMIT:
+                raise RuntimeError("База слишком большая для отправки в Telegram даже после сжатия")
+        _telegram_send_file(BACKUP_CHAT_ID, name, data, caption)
+        with open(_BACKUP_STAMP, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        return name
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def maybe_backup_async() -> None:
+    """Дёшево вызывается из обычных запросов: если пора, запускает бэкап в фоне."""
+    if not (BOT_TOKEN and BACKUP_CHAT_ID):
+        return
+    now = time.time()
+    if now - _backup_state["last_check"] < 300:        # проверяем не чаще раза в 5 минут
+        return
+    _backup_state["last_check"] = now
+    if not _backup_due(now) or now - _backup_state["last_attempt"] < 3600:   # после неудачи — не чаще раза в час
+        return
+    if not _backup_lock.acquire(blocking=False):
+        return
+    _backup_state["last_attempt"] = now
+
+    def run():
+        try:
+            do_backup_to_telegram()
+        except Exception as e:
+            print(f"⚠️ Автобэкап не удался: {e}")
+        finally:
+            _backup_lock.release()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def get_user_id(x_init_data: str = Header(...)) -> str:
     info = parse_telegram_user(x_init_data)
     if not info or not info.get("id"):
@@ -559,6 +695,10 @@ def get_user_id(x_init_data: str = Header(...)) -> str:
     uid = info["id"]
     with get_db() as conn:
         ensure_profile_and_user(conn, uid, info.get("username"), info.get("first_name"))
+    try:
+        maybe_backup_async()
+    except Exception:
+        pass   # бэкап никогда не должен ломать обычный запрос
     return uid
 
 
@@ -4040,6 +4180,7 @@ def admin_page(title: str, body: str) -> HTMLResponse:
         '<a href="/admin/news">Новости</a>'
         '<a href="/admin/sql">SQL-запрос</a>'
         '<a href="/admin/db/download">Скачать базу</a>'
+        '<a href="/admin/backup">Бэкап в Telegram</a>'
         '<a href="/admin/db/upload">Загрузить базу</a>'
         "</div>"
     )
@@ -4494,6 +4635,41 @@ async def admin_sql_run(request: Request, _: bool = Depends(verify_admin)):
         + f'<div style="height:16px"></div>{result_html}'
     )
     return admin_page("SQL-запрос", body)
+
+
+def _backup_status_html() -> str:
+    ts = _backup_last_ts()
+    last = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ts)) if ts else "ещё не было")
+    rows = [
+        ("BOT_TOKEN", "задан" if BOT_TOKEN else "НЕ ЗАДАН"),
+        ("BACKUP_CHAT_ID", "задан" if BACKUP_CHAT_ID else "НЕ ЗАДАН (Railway → Variables)"),
+        ("Как часто", f"раз в {BACKUP_EVERY_DAYS:g} дн."),
+        ("Последний бэкап", last),
+    ]
+    return "<table>" + "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td></tr>" for a, b in rows) + "</table>"
+
+
+@app.get("/admin/backup", response_class=HTMLResponse, include_in_schema=False)
+def admin_backup_page(_: bool = Depends(verify_admin)):
+    return admin_page("Бэкап в Telegram", _backup_status_html() + (
+        '<p>Бот пришлёт файл базы документом в личные сообщения. Автоматически это происходит само, '
+        'когда приложением пользуются и с прошлого бэкапа прошло достаточно времени. '
+        'Если Telegram пишет «bot can\'t initiate conversation» — открой бота и нажми /start.</p>'
+        '<form method="post" action="/admin/backup/now"><button type="submit">Отправить бэкап сейчас</button></form>'))
+
+
+@app.post("/admin/backup/now", response_class=HTMLResponse, include_in_schema=False)
+def admin_backup_now(_: bool = Depends(verify_admin)):
+    if not _backup_lock.acquire(blocking=False):
+        return admin_page("Бэкап в Telegram", "<p>Бэкап уже выполняется — подожди минуту.</p>" + _backup_status_html())
+    try:
+        name = do_backup_to_telegram()
+        msg = f"<p>✅ Отправлено: {html.escape(name)}</p>"
+    except Exception as e:
+        msg = f"<p>❌ Не удалось: {html.escape(str(e))}</p>"
+    finally:
+        _backup_lock.release()
+    return admin_page("Бэкап в Telegram", msg + _backup_status_html())
 
 
 @app.get("/admin/db/download", include_in_schema=False)

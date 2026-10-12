@@ -395,6 +395,9 @@ def init_db():
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(workouts)").fetchall()]
         if "profile_id" not in cols:
             conn.execute("ALTER TABLE workouts ADD COLUMN profile_id INTEGER")
+        # Длительность тренировки в секундах (NULL — не записана): с таймера в форме или вручную
+        if "duration_sec" not in cols:
+            conn.execute("ALTER TABLE workouts ADD COLUMN duration_sec INTEGER")
         cols = [r["name"] for r in conn.execute("PRAGMA table_info(measurements)").fetchall()]
         if "profile_id" not in cols:
             conn.execute("ALTER TABLE measurements ADD COLUMN profile_id INTEGER")
@@ -1210,6 +1213,25 @@ def _check_exercises(exs, max_items=100, max_sets=100, max_json=400_000):
     if len(json.dumps(exs, ensure_ascii=False)) > max_json:
         raise HTTPException(413, "Слишком большой объём данных")
 
+MAX_DURATION_SEC = 48 * 3600
+
+def _check_duration(sec):
+    if sec is not None and not (0 <= sec <= MAX_DURATION_SEC):
+        raise HTTPException(400, "Неверная длительность")
+
+def _row_dur(r):
+    """duration_sec из строки БД; терпимо к базе без этой колонки (старый файл после восстановления)."""
+    try:
+        return r["duration_sec"]
+    except (IndexError, KeyError):
+        return None
+
+def _fmt_duration_ru(sec) -> str:
+    if sec is None:
+        return ""
+    h, m = divmod(int(sec) // 60, 60)
+    return (f"{h} ч {m:02d} мин" if h else f"{m} мин") if (h or m) else "меньше минуты"
+
 def _check_title(name, limit=200):
     if len(name or "") > limit:
         raise HTTPException(400, "Слишком длинное название")
@@ -1220,6 +1242,7 @@ class WorkoutIn(BaseModel):
     name:      str
     date:      str
     exercises: list
+    duration_sec: Optional[int] = None   # длительность тренировки, сек; не передано — не менять
 
 class MeasurementIn(BaseModel):
     id:   int
@@ -1354,12 +1377,13 @@ def list_workouts(x_init_data: str = Header(...)):
         rows = conn.execute(
             "SELECT * FROM workouts WHERE profile_id=? ORDER BY id DESC", (pid,)
         ).fetchall()
-    return [{"id":r["id"],"name":r["name"],"date":r["date"],"exercises":json.loads(r["exercises"])} for r in rows]
+    return [{"id":r["id"],"name":r["name"],"date":r["date"],"exercises":json.loads(r["exercises"]),
+             "duration_sec":_row_dur(r)} for r in rows]
 
 
 @app.post("/workouts")
 def save_workout(w: WorkoutIn, x_init_data: str = Header(...)):
-    _check_date(w.date); _check_title(w.name); _check_exercises(w.exercises)
+    _check_date(w.date); _check_title(w.name); _check_exercises(w.exercises); _check_duration(w.duration_sec)
     uid = get_user_id(x_init_data)
     with get_db() as conn:
         pid = get_active_profile_id(conn, uid)
@@ -1370,16 +1394,22 @@ def save_workout(w: WorkoutIn, x_init_data: str = Header(...)):
         else:
             existing = None
 
+        # «поле не передано» (старый фронтенд) ≠ «передано null»: в первом случае длительность не трогаем
+        fields_set = getattr(w, "model_fields_set", None)
+        if fields_set is None:
+            fields_set = getattr(w, "__fields_set__", set())
         if existing:
             conn.execute(
                 "UPDATE workouts SET name=?, date=?, exercises=? WHERE profile_id=? AND id=?",
                 (w.name, w.date, json.dumps(w.exercises, ensure_ascii=False), pid, w.id)
             )
+            if "duration_sec" in fields_set:
+                conn.execute("UPDATE workouts SET duration_sec=? WHERE profile_id=? AND id=?", (w.duration_sec, pid, w.id))
             return {"ok": True, "id": w.id}
         else:
             cur = conn.execute(
-                "INSERT INTO workouts (user_id, profile_id, name, date, exercises) VALUES (?,?,?,?,?)",
-                (uid, pid, w.name, w.date, json.dumps(w.exercises, ensure_ascii=False))
+                "INSERT INTO workouts (user_id, profile_id, name, date, exercises, duration_sec) VALUES (?,?,?,?,?,?)",
+                (uid, pid, w.name, w.date, json.dumps(w.exercises, ensure_ascii=False), w.duration_sec)
             )
             return {"ok": True, "id": cur.lastrowid}
 
@@ -2136,7 +2166,8 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
     history_by_name = {}
     for w in sorted(workout_rows, key=lambda r: (r["date"], r["id"])):
         exercises = json.loads(w["exercises"])
-        lines.append(f"{_fmt_date_ru(w['date'])} · {w['name']}")
+        dur = _row_dur(w)
+        lines.append(f"{_fmt_date_ru(w['date'])} · {w['name']}" + (f" · {_fmt_duration_ru(dur)}" if dur is not None else ""))
         for i, ex in enumerate(exercises, 1):
             ex_name = (ex.get("name") or f"Упражнение {i}").strip()
             set_lines = [fs for fs in (_fmt_set_line(s) for s in ex.get("sets", [])) if fs]
@@ -2629,7 +2660,7 @@ def get_friend_profile(friend_id: str, x_init_data: str = Header(...)):
                 if not show_c:
                     for ex in exs:
                         ex["comment"] = ""
-                workouts.append({"id": r["id"], "name": r["name"], "date": r["date"], "exercises": exs})
+                workouts.append({"id": r["id"], "name": r["name"], "date": r["date"], "exercises": exs, "duration_sec": _row_dur(r)})
 
         measurements = []
         weigh_ins = []
@@ -2821,6 +2852,7 @@ def _feed_posts_for_owner(conn, owner_id: str, viewer_id: str, profile, is_self:
                 "post_type": "workout", "post_id": r["id"],
                 "date": r["date"], "sort_key": f"{r['date']}T{r['id']:08d}",
                 "author": author, "title": r["name"], "exercises": exs,
+                "duration_sec": _row_dur(r),
             })
 
     if show_m:
@@ -4709,6 +4741,10 @@ async def admin_db_upload_submit(file: UploadFile = File(...), _: bool = Depends
         shutil.copy(DB_PATH, backup_path)
     with open(DB_PATH, "wb") as f:
         f.write(content)
+    try:
+        init_db()   # догоняем схему: загруженная база могла быть сделана более старой версией
+    except Exception as e:
+        print(f"⚠️ Миграции после замены базы: {e}")
 
     body = (
         f'<div class="ok">База заменена. Резервная копия старой версии: {html.escape(backup_path)}</div>'

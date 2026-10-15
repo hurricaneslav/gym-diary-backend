@@ -2172,7 +2172,10 @@ def _build_profile_export(profile_name: str, workout_rows, measurement_rows, exe
             ex_name = (ex.get("name") or f"Упражнение {i}").strip()
             set_lines = [fs for fs in (_fmt_set_line(s) for s in ex.get("sets", [])) if fs]
             comment = (ex.get("comment") or "").strip()
-            lines.append(f"  {i}. {ex_name}")
+            # время, затраченное на упражнение (по таймеру в форме), — если записано
+            ex_dur = ex.get("dur_sec")
+            dur_txt = f" · {_fmt_duration_ru(ex_dur)}" if isinstance(ex_dur, (int, float)) and not isinstance(ex_dur, bool) and ex_dur > 0 else ""
+            lines.append(f"  {i}. {ex_name}{dur_txt}")
             for si, fs in enumerate(set_lines, 1):
                 lines.append(f"     {si}) {fs}")
             if comment:
